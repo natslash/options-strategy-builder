@@ -31,3 +31,6 @@ replay_pid*
 # Claude
 .claude/settings.json
 .claude/settings.local.json
+
+# Maven build output
+**/target/
