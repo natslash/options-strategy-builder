@@ -5,41 +5,42 @@ import com.ib.client.Types;
 import com.natslash.options_strategy_builder.entity.ChainContract;
 import com.natslash.options_strategy_builder.entity.ChainSnapshot;
 import com.natslash.options_strategy_builder.entity.Instrument;
+import com.natslash.options_strategy_builder.model.ChainParams;
 import com.natslash.options_strategy_builder.model.OptionContract;
+import com.natslash.options_strategy_builder.model.TickData;
 import com.natslash.options_strategy_builder.repository.ChainContractRepository;
 import com.natslash.options_strategy_builder.repository.ChainSnapshotRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class OptionsChainService {
 
-    private static final int    BATCH_SIZE        = 40;
     private static final int    WINDOW_MS         = 3000;
-    private static final int    BATCH_PAUSE_MS    = 100;
     private static final int    CACHE_TTL_MINUTES = 5;
     private static final int    MAX_DTE_DAYS      = 180;
     private static final DateTimeFormatter FMT    = DateTimeFormatter.ofPattern("yyyyMMdd");
-    private static final ZoneId CET               = ZoneId.of("Europe/Berlin");
 
     // IBKR market data types
-    private static final int MDT_LIVE    = 1;
-    private static final int MDT_FROZEN  = 2;
+    private static final int MDT_LIVE   = 1;
+    private static final int MDT_FROZEN = 2;
 
-    private final IbkrClientService       ibkr;
-    private final ChainSnapshotRepository snapshotRepo;
-    private final ChainContractRepository contractRepo;
+    private final IbkrClientService         ibkr;
+    private final RateLimitedRequestManager rateLimiter;
+    private final ChainSnapshotRepository   snapshotRepo;
+    private final ChainContractRepository   contractRepo;
+    private final TradingSchedule           schedule;
+    private final ChainContractMapper       mapper;
 
     // ═══════════════════════════════════════════════════════════
     // Public API
@@ -54,12 +55,12 @@ public class OptionsChainService {
             if (cached.isPresent() && isCacheValid(cached.get())) {
                 log.info("Serving chain from cache (snapshot id={} fetchedAt={})",
                         cached.get().getId(), cached.get().getFetchedAt());
-                return toOptionContracts(contractRepo.findBySnapshot(cached.get()), cached.get().getSpot());
+                return mapper.toOptionContracts(contractRepo.findBySnapshot(cached.get()), cached.get().getSpot());
             }
         }
 
         // 2. Set market data type — frozen outside hours so we get last known prices
-        boolean marketHours = isMarketHours();
+        boolean marketHours = schedule.isMarketHours();
         if (!marketHours) {
             ibkr.reqMarketDataType(MDT_FROZEN);
             log.info("Outside market hours — using frozen data");
@@ -68,8 +69,8 @@ public class OptionsChainService {
         }
 
         // 3. Get chain params
-        IbkrClientService.ChainParams params =
-                ibkr.reqChainParams(instrument.getSymbol(), "IND", instrument.getConId());
+        ChainParams params =
+                ibkr.reqChainParams(instrument.getSymbol(), "IND", instrument.getConId()).join();
 
         // 4. Fetch spot — try live/frozen option data first, fall back to DB, then providedSpot
         double spot;
@@ -107,26 +108,17 @@ public class OptionsChainService {
     // ═══════════════════════════════════════════════════════════
 
     private boolean isCacheValid(ChainSnapshot snapshot) {
-        if (isMarketHours()) {
+        if (schedule.isMarketHours()) {
             return snapshot.getFetchedAt().isAfter(LocalDateTime.now().minusMinutes(CACHE_TTL_MINUTES));
         }
         return true;
-    }
-
-    private boolean isMarketHours() {
-        ZonedDateTime now     = ZonedDateTime.now(CET);
-        int           timeNow = now.getHour() * 100 + now.getMinute();
-        return now.getDayOfWeek() != DayOfWeek.SATURDAY
-                && now.getDayOfWeek() != DayOfWeek.SUNDAY
-                && timeNow >= 900
-                && timeNow <= 1730;
     }
 
     // ═══════════════════════════════════════════════════════════
     // Spot price — from ATM option undPrice (no extra subscription needed)
     // ═══════════════════════════════════════════════════════════
 
-    private double fetchSpotFromOption(Instrument instrument, IbkrClientService.ChainParams params)
+    private double fetchSpotFromOption(Instrument instrument, ChainParams params)
             throws InterruptedException {
 
         // Pick a round-number strike as proxy ATM
@@ -134,14 +126,14 @@ public class OptionsChainService {
                 .min(Comparator.comparingDouble(s -> s % 100))
                 .orElseThrow(() -> new RuntimeException("No strikes available"));
 
-        List<String> expiries = filterMonthlyExpiries(params.expirations(), MAX_DTE_DAYS);
+        List<String> expiries = schedule.filterMonthlyExpiries(params.expirations(), MAX_DTE_DAYS);
         if (expiries.isEmpty())
             throw new RuntimeException("No expiries available for " + instrument.getSymbol());
 
         // Single call — undPrice comes free with tickOptionComputation
-        ContractRequest            req  = new ContractRequest(expiries.get(0), proxyAtm, "C");
-        Contract                   c    = buildOptionContract(req, instrument);
-        IbkrClientService.TickData tick = ibkr.reqMktData(c, WINDOW_MS);
+        ContractRequest req  = new ContractRequest(expiries.get(0), proxyAtm, "C");
+        Contract        c    = buildOptionContract(req, instrument);
+        TickData        tick = ibkr.reqMktData(c, WINDOW_MS).join();
 
         if (tick != null && tick.undPrice() != null && tick.undPrice() > 0) {
             log.info("Spot from undPrice of {}/{}/C: {}", expiries.get(0), proxyAtm, tick.undPrice());
@@ -160,12 +152,12 @@ public class OptionsChainService {
     // ═══════════════════════════════════════════════════════════
 
     private List<OptionContract> fetchFromIbkr(Instrument instrument,
-                                                IbkrClientService.ChainParams params,
-                                                double spot) throws Exception {
+                                                ChainParams params,
+                                                double spot) {
         long fetchStart = System.currentTimeMillis();
 
         // Filter expiries
-        List<String> expiries = filterMonthlyExpiries(params.expirations(), MAX_DTE_DAYS);
+        List<String> expiries = schedule.filterMonthlyExpiries(params.expirations(), MAX_DTE_DAYS);
         expiries = expiries.subList(0, Math.min(expiries.size(), instrument.getMaxExpiries()));
         log.info("Expiries ({}): {}", expiries.size(), expiries);
 
@@ -178,59 +170,52 @@ public class OptionsChainService {
                 .toList();
         log.info("Spot={} ATM={} strikeRange=±{} → {} strikes", spot, atm, instrument.getStrikeRange(), strikes.size());
 
-        // Build requests
+        // Build contract request list
         List<ContractRequest> requests = new ArrayList<>();
         for (String expiry : expiries)
             for (double strike : strikes) {
                 requests.add(new ContractRequest(expiry, strike, "C"));
                 requests.add(new ContractRequest(expiry, strike, "P"));
             }
-        log.info("Fetching {} contracts in batches of {}", requests.size(), BATCH_SIZE);
 
-        // Fetch in batches using virtual threads
-        List<OptionContract> chain    = new ArrayList<>();
-        int                  batchNum = 0;
+        int multiplier = instrument.getMultiplier();
+        log.info("Fetching {} contracts via rate limiter ({} req/s)",
+                requests.size(), 1000 / RateLimitedRequestManager.RATE_MS);
 
-        for (int i = 0; i < requests.size(); i += BATCH_SIZE) {
-            batchNum++;
-            long                  batchStart = System.currentTimeMillis();
-            List<ContractRequest> batch      = requests.subList(i, Math.min(i + BATCH_SIZE, requests.size()));
-            List<Thread>          threads    = new ArrayList<>();
-            List<OptionContract>  results    = Collections.synchronizedList(new ArrayList<>());
+        // Submit all fetches through the rate limiter. submit() enqueues immediately
+        // and returns a promise; the scheduler fires one reqMktData per RATE_MS.
+        List<CompletableFuture<Optional<OptionContract>>> futures = requests.stream()
+                .map(req -> rateLimiter.submit(() ->
+                        ibkr.reqMktData(buildOptionContract(req, instrument), WINDOW_MS)
+                                .thenApply(tick -> {
+                                    log.debug("{}/{}/{} bid={} greeks={}",
+                                            req.expiry(), req.strike(), req.type(),
+                                            tick.bid(), tick.greeksReceived());
+                                    if (tick.hasData())
+                                        return Optional.of(toOptionContract(req, tick, spot, multiplier));
+                                    return Optional.<OptionContract>empty();
+                                })
+                                .exceptionally(ex -> {
+                                    log.debug("Tick fetch failed {}/{}/{}: {}",
+                                            req.expiry(), req.strike(), req.type(), ex.getMessage());
+                                    return Optional.empty();
+                                })
+                ))
+                .collect(Collectors.toList());
 
-            for (ContractRequest req : batch) {
-                Thread t = Thread.ofVirtual().start(() -> {
-                    try {
-                        long t0 = System.currentTimeMillis();
-                        Contract c = buildOptionContract(req, instrument);
-                        IbkrClientService.TickData tick = ibkr.reqMktData(c, WINDOW_MS);
-                        log.debug("contract {}/{}/{} resolved in {}ms bid={} greeks={}",
-                                req.expiry(), req.strike(), req.type(),
-                                System.currentTimeMillis() - t0,
-                                tick != null ? tick.bid() : null,
-                                tick != null && tick.greeksReceived());
-                        if (tick != null && tick.hasData())
-                            results.add(toOptionContract(req, tick, spot, instrument.getMultiplier()));
-                    } catch (Exception e) {
-                        log.debug("Tick fetch failed {}/{}/{}: {}",
-                                req.expiry(), req.strike(), req.type(), e.getMessage());
-                    }
-                });
-                threads.add(t);
-            }
+        List<OptionContract> chain = futures.stream()
+                .map(CompletableFuture::join)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(Collectors.toCollection(ArrayList::new));
 
-            for (Thread t : threads) t.join();
+        List<OptionContract> result = dedup(chain);
+        log.info("Chain complete — {} contracts ({} after dedup) in {}ms",
+                chain.size(), result.size(), System.currentTimeMillis() - fetchStart);
+        return result;
+    }
 
-            chain.addAll(results);
-            log.info("Batch {}/{} ({} contracts) done in {}ms — {} results",
-                    batchNum, (requests.size() + BATCH_SIZE - 1) / BATCH_SIZE,
-                    batch.size(), System.currentTimeMillis() - batchStart, results.size());
-
-            if (i + BATCH_SIZE < requests.size())
-                Thread.sleep(BATCH_PAUSE_MS);
-        }
-
-        // Deduplicate
+    private List<OptionContract> dedup(List<OptionContract> chain) {
         Map<String, OptionContract> seen = new LinkedHashMap<>();
         for (OptionContract c : chain) {
             String key = c.getExpiry() + "_" + c.getStrike() + "_" + c.getType();
@@ -238,11 +223,7 @@ public class OptionsChainService {
                     "IBKR".equals(incoming.getGreeksSource()) && !"IBKR".equals(existing.getGreeksSource())
                             ? incoming : existing);
         }
-
-        List<OptionContract> result = new ArrayList<>(seen.values());
-        log.info("Chain complete — {} contracts ({} after dedup) in {}ms",
-                chain.size(), result.size(), System.currentTimeMillis() - fetchStart);
-        return result;
+        return new ArrayList<>(seen.values());
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -254,11 +235,11 @@ public class OptionsChainService {
         snapshot.setInstrument(instrument);
         snapshot.setFetchedAt(LocalDateTime.now());
         snapshot.setSpot(spot);
-        snapshot.setMarketHours(isMarketHours());
+        snapshot.setMarketHours(schedule.isMarketHours());
         snapshotRepo.save(snapshot);
 
         List<ChainContract> entities = contracts.stream()
-                .map(c -> toChainContract(c, snapshot))
+                .map(c -> mapper.toChainContract(c, snapshot))
                 .toList();
         contractRepo.saveAll(entities);
 
@@ -266,53 +247,10 @@ public class OptionsChainService {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // Mapping
+    // Mapping — converts raw IBKR tick + request into an OptionContract
     // ═══════════════════════════════════════════════════════════
 
-    private List<OptionContract> toOptionContracts(List<ChainContract> entities, double spot) {
-        return entities.stream().map(e -> OptionContract.builder()
-                .expiry(e.getExpiry())
-                .dte(e.getDte())
-                .strike(e.getStrike())
-                .type(e.getType())
-                .bid(e.getBid())
-                .ask(e.getAsk())
-                .midPrice(e.getMid())
-                .close(e.getClose())
-                .iv(e.getIv())
-                .delta(e.getDelta())
-                .gamma(e.getGamma())
-                .theta(e.getTheta())
-                .vega(e.getVega())
-                .premiumEur(e.getPremiumEur())
-                .otmPct(e.getOtmPct())
-                .greeksSource(e.getGreeksSource())
-                .build()).toList();
-    }
-
-    private ChainContract toChainContract(OptionContract oc, ChainSnapshot snapshot) {
-        ChainContract e = new ChainContract();
-        e.setSnapshot(snapshot);
-        e.setExpiry(oc.getExpiry());
-        e.setDte(oc.getDte());
-        e.setStrike(oc.getStrike());
-        e.setType(oc.getType());
-        e.setBid(oc.getBid());
-        e.setAsk(oc.getAsk());
-        e.setMid(oc.getMidPrice());
-        e.setClose(oc.getClose());
-        e.setIv(oc.getIv());
-        e.setDelta(oc.getDelta());
-        e.setGamma(oc.getGamma());
-        e.setTheta(oc.getTheta());
-        e.setVega(oc.getVega());
-        e.setPremiumEur(oc.getPremiumEur());
-        e.setOtmPct(oc.getOtmPct());
-        e.setGreeksSource(oc.getGreeksSource());
-        return e;
-    }
-
-    private OptionContract toOptionContract(ContractRequest req, IbkrClientService.TickData tick,
+    private OptionContract toOptionContract(ContractRequest req, TickData tick,
                                              double spot, int multiplier) {
         LocalDate expDate    = LocalDate.parse(req.expiry(), FMT);
         int       dte        = (int) (expDate.toEpochDay() - LocalDate.now().toEpochDay());
@@ -345,7 +283,7 @@ public class OptionsChainService {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // Contract builders
+    // Contract builder
     // ═══════════════════════════════════════════════════════════
 
     private Contract buildOptionContract(ContractRequest req, Instrument instrument) {
@@ -360,28 +298,6 @@ public class OptionsChainService {
         c.multiplier(String.valueOf(instrument.getMultiplier()));
         c.tradingClass(instrument.getTradingClass());
         return c;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // Helpers
-    // ═══════════════════════════════════════════════════════════
-
-    private List<String> filterMonthlyExpiries(List<String> expirations, int maxDte) {
-        LocalDate today  = LocalDate.now();
-        LocalDate maxDay = today.plusDays(maxDte);
-        return expirations.stream()
-                .filter(e -> {
-                    LocalDate d = LocalDate.parse(e, FMT);
-                    return d.isAfter(today) && !d.isAfter(maxDay) && isThirdFriday(d);
-                })
-                .sorted()
-                .toList();
-    }
-
-    private boolean isThirdFriday(LocalDate d) {
-        return d.getDayOfWeek() == DayOfWeek.FRIDAY
-                && d.getDayOfMonth() >= 15
-                && d.getDayOfMonth() <= 21;
     }
 
     private record ContractRequest(String expiry, double strike, String type) {}

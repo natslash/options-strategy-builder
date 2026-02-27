@@ -14,7 +14,7 @@ import java.util.*;
 @RequiredArgsConstructor
 public class StrategyService {
 
-    private final IbkrClientService    ibkr;
+    private final MarketDataService    marketDataService;
     private final InstrumentRepository instrumentRepository;
 
     // ═══════════════════════════════════════════════════════════
@@ -152,14 +152,14 @@ public class StrategyService {
             }
         }
 
-        // Enrich legs with nearest available strikes from chain
+        // Snap leg strikes to nearest available strike from IBKR chain
         enrichLegsFromChain(legs, req.getInstrumentId());
 
         return new StrategyRequest(
-        req.getName() != null ? req.getName() : PresetStrategy.valueOf(req.getPreset()).getDisplayName(),
-        spot,
-        req.getInstrumentId(),
-        legs);
+                req.getName() != null ? req.getName() : PresetStrategy.valueOf(req.getPreset()).getDisplayName(),
+                spot,
+                req.getInstrumentId(),
+                legs);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -167,33 +167,24 @@ public class StrategyService {
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * Snaps leg strikes to nearest available strike from IBKR chain params.
-     * Uses instrumentId to look up instrument config from DB.
+     * Snaps leg strikes to the nearest available strike returned by MarketDataService.
+     * No-ops silently when instrumentId is null or strikes are unavailable.
      */
     private void enrichLegsFromChain(List<StrategyLeg> legs, Long instrumentId) {
         if (instrumentId == null) return;
-        try {
-            Instrument instrument = instrumentRepository.findById(instrumentId).orElse(null);
-            if (instrument == null) {
-                log.warn("Instrument not found id={}, skipping leg enrichment", instrumentId);
-                return;
-            }
-            IbkrClientService.ChainParams params =
-                    ibkr.reqChainParams(instrument.getSymbol(), "IND", instrument.getConId());
-            for (StrategyLeg leg : legs) {
-                double nearest = params.strikes().stream()
-                        .min(Comparator.comparingDouble(s -> Math.abs(s - leg.getStrike())))
-                        .orElse(leg.getStrike());
-                leg.setStrike(nearest);
-            }
-        } catch (Exception e) {
-            log.warn("Could not enrich preset legs from chain: {}", e.getMessage());
+        List<Double> strikes = marketDataService.getAvailableStrikes(instrumentId);
+        if (strikes.isEmpty()) return;
+        for (StrategyLeg leg : legs) {
+            double nearest = strikes.stream()
+                    .min(Comparator.comparingDouble(s -> Math.abs(s - leg.getStrike())))
+                    .orElse(leg.getStrike());
+            leg.setStrike(nearest);
         }
     }
 
     /**
-     * Resolve multiplier: prefer instrument from DB via instrumentId on request,
-     * fall back to 10 (ESTX50 default) if not provided.
+     * Resolves the contract multiplier from the instrument DB record.
+     * Falls back to 10 (ESTX50 default) when no instrumentId is provided.
      */
     private int resolveMultiplier(StrategyRequest req) {
         if (req.getInstrumentId() != null) {

@@ -40,7 +40,7 @@ public class ChainController {
     public ResponseEntity<List<InstrumentSearchResult>> searchInstruments(
             @RequestParam String symbol) throws Exception {
 
-        List<ContractDetails> results = ibkr.reqContractDetails(symbol.toUpperCase(), "IND");
+        List<ContractDetails> results = ibkr.reqContractDetails(symbol.toUpperCase(), "IND").join();
 
         List<InstrumentSearchResult> response = results.stream()
                 .map(cd -> InstrumentSearchResult.builder()

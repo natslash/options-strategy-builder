@@ -1,5 +1,6 @@
 package com.natslash.options_strategy_builder.service;
 
+import com.natslash.options_strategy_builder.model.TickData;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.*;
@@ -66,7 +67,7 @@ class TickDataTest {
 
     @Test
     void hasData_true_whenGreeksReceived() {
-        var tick = new IbkrClientService.TickData(
+        var tick = new TickData(
                 null, null, null, null,
                 null, null,
                 0.20, 0.5, 0.001, 0.05, -1.0,
@@ -76,7 +77,7 @@ class TickDataTest {
 
     @Test
     void hasData_false_whenAllNullAndNoGreeks() {
-        var tick = new IbkrClientService.TickData(
+        var tick = new TickData(
                 null, null, null, null,
                 null, null,
                 null, null, null, null, null,
@@ -87,9 +88,9 @@ class TickDataTest {
     // ── helper ────────────────────────────────────────────────────────────
 
     /** Creates a TickData with bid/ask/last/close set and all Greeks null. */
-    private IbkrClientService.TickData tickData(Double bid, Double ask,
+    private TickData tickData(Double bid, Double ask,
                                                   Double last, Double close) {
-        return new IbkrClientService.TickData(
+        return new TickData(
                 bid, ask, last, close,
                 null, null,
                 null, null, null, null, null,
