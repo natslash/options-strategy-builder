@@ -30,3 +30,6 @@ replay_pid*
 
 # Maven build output
 **/target/
+
+#VS Code files
+.vscode
