@@ -1,0 +1,69 @@
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "disabled": false,
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      },
+      "timeout": 60000,
+      "description": "GitHub Copilot MCP server for repository operations"
+    },
+    "chrome-devtools": {
+      "type": "stdio",
+      "disabled": false,
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ],
+      "timeout": 60000
+    },
+    "browser-use": {
+      "type": "stdio",
+      "disabled": false,
+      "description": "Browser automation for web testing, form filling, screenshots, and data extraction.",
+      "command": "uvx",
+      "args": [
+        "browser-use[cli]",
+        "--mcp"
+      ],
+      "timeout": 60000
+    },
+    "context7": {
+      "type": "stdio",
+      "disabled": false,
+      "description": "Context7 MCP pulls up-to-date, version-specific documentation and code examples straight from the source — and places them directly into your prompt.",
+      "command": "npx",
+      "timeout": 60000,
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ]
+    },
+    "postgres": {
+      "type": "stdio",
+      "disabled": false,
+      "description": "PostgreSQL MCP server for schema inspection and read-only query execution.",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "${POSTGRES_CONNECTION_STRING}"
+      ],
+      "timeout": 60000
+    },
+    "docker": {
+      "type": "stdio",
+      "disabled": false,
+      "description": "Docker MCP server for container and image management.",
+      "command": "npx",
+      "args": [
+        "-y",
+        "docker-mcp"
+      ],
+      "timeout": 60000
+    }
+  }
+}

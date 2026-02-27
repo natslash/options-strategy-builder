@@ -28,9 +28,5 @@ replay_pid*
 .DS_Store
 **/.DS_Store
 
-# Claude
-.claude/settings.json
-.claude/settings.local.json
-
 # Maven build output
 **/target/
