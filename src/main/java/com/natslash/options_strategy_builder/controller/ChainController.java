@@ -91,7 +91,8 @@ public class ChainController {
                             .secType(cd.contract().secType().name())   // enum → "IND" / "STK"
                             .alreadySaved(instrumentRepository
                                     .findBySymbolAndExchange(cd.contract().symbol(), cd.contract().exchange())
-                                    .isPresent())
+                                    .map(i -> Boolean.TRUE.equals(i.getActive()))
+                                    .orElse(false))
                             .build())
                     .toList();
 
