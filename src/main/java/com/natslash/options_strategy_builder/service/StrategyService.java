@@ -70,8 +70,9 @@ public class StrategyService {
         for (int i = 1; i < spots.size(); i++) {
             double prev = pnlAtExpiry.get(spots.get(i - 1));
             double curr = pnlAtExpiry.get(spots.get(i));
-            if (prev * curr <= 0) {
-                double be = spots.get(i - 1) + (0 - prev) / (curr - prev) * step;
+            double diff = curr - prev;
+            if (prev * curr <= 0 && diff != 0) {
+                double be = spots.get(i - 1) + (0 - prev) / diff * step;
                 if (breakEvenLow == null) breakEvenLow = be;
                 else                      breakEvenHigh = be;
             }
