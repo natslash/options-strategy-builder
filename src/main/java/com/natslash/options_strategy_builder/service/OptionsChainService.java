@@ -146,7 +146,7 @@ public class OptionsChainService {
         // Frozen mode needs extra time for the model calculation to arrive
         int tickTimeout = marketHours ? WINDOW_MS : WINDOW_MS + 500;
         List<OptionContract> contracts = fetchFromIbkr(
-                instrument, params, spot, expiry, includeMonthly, includeWeekly, strikeFilter, strikeRangePct, tickTimeout);
+                instrument, params, spot, expiry, includeMonthly, includeWeekly, strikeFilter, strikeRangePct, tickTimeout, marketHours);
 
         // 5. Reset to live data
         ibkr.reqMarketDataType(MDT_LIVE);
@@ -220,7 +220,8 @@ public class OptionsChainService {
                                                 boolean includeWeekly,
                                                 String strikeFilter,
                                                 double strikeRangePct,
-                                                int tickTimeoutMs) {
+                                                int tickTimeoutMs,
+                                                boolean marketHours) {
         long fetchStart = System.currentTimeMillis();
 
         // Filter expiries by requested type
@@ -288,7 +289,7 @@ public class OptionsChainService {
                                     }
                                     // Always include the contract — empty data shows as dashes in the UI.
                                     // The frontend 'Quoted' display filter handles visibility.
-                                    return Optional.of(toOptionContract(req, tick, spot, multiplier));
+                                    return Optional.of(toOptionContract(req, tick, spot, multiplier, marketHours));
                                 })
                                 .exceptionally(ex -> {
                                     log.warn("Tick fetch failed {}/{}/{}: {}",
@@ -330,7 +331,7 @@ public class OptionsChainService {
     // ═══════════════════════════════════════════════════════════
 
     private OptionContract toOptionContract(ContractRequest req, TickData tick,
-                                             double spot, int multiplier) {
+                                             double spot, int multiplier, boolean marketHours) {
         LocalDate expDate    = LocalDate.parse(req.expiry(), FMT);
         int       dte        = (int) (expDate.toEpochDay() - LocalDate.now().toEpochDay());
         Double    mid        = tick.mid();
@@ -360,7 +361,25 @@ public class OptionsChainService {
                 .volume(tick.volume())
                 .openInterest(tick.openInterest())
                 .greeksSource(tick.greeksReceived() ? "IBKR" : "NONE")
+                .confidenceScore(calculateConfidenceScore(tick, marketHours))
                 .build();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Confidence scoring
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * 3 = Live  : market open, real-time bid + ask Greeks
+     * 2 = Model : market closed, IBKR server-side Black-Scholes (Field 13)
+     * 1 = Stale : Greeks present but no bid/ask size (illiquid or wide spread)
+     * 0 = None  : no Greeks received at all
+     */
+    private int calculateConfidenceScore(TickData tick, boolean marketOpen) {
+        if (!tick.greeksReceived()) return 0;
+        if (marketOpen && tick.bid() != null && tick.ask() != null) return 3;
+        if (!marketOpen) return 2;
+        return 1; // market open but bid or ask missing — illiquid strike
     }
 
     // ═══════════════════════════════════════════════════════════

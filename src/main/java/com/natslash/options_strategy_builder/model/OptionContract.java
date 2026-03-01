@@ -40,5 +40,6 @@ public class OptionContract {
     private int    askSize;
     private int    volume;
     private int    openInterest;
-    private String greeksSource; // "IBKR" or "NONE"
+    private String greeksSource;    // "IBKR" or "NONE"
+    private int    confidenceScore; // 0=no data, 1=low liquidity, 2=model/frozen, 3=live
 }
