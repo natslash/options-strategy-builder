@@ -29,15 +29,16 @@ class IbkrDispatcherTest {
     // ── Snapshot wire format ────────────────────────────────────
 
     /**
-     * Frozen streaming mode: snapshot=false, genericTickList="101" (Option PV Dividend
-     * forces IBKR to run the internal Greeks model even when the market is closed).
+     * Streaming mode with model-Greek tick list: snapshot=false,
+     * genericTickList="100,101,106" (106 = Option Implied Volatility forces IBKR
+     * to run Black-Scholes and emit tick type 13 MODEL_OPTION for off-hours contracts).
      */
     @Test
-    void reqMktData_uses_streaming_with_101_genericTick() {
+    void reqMktData_uses_streaming_with_model_greek_ticks() {
         dispatcher.reqMktData(mockContract, 5000);
 
         verify(mockClient).reqMktData(
-                anyInt(), eq(mockContract), eq("101"),
+                anyInt(), eq(mockContract), eq("100,101,106"),
                 eq(false), eq(false), any());
     }
 

@@ -135,10 +135,14 @@ public class IbkrDispatcher extends DefaultEWrapper {
         TickAccumulator acc = new TickAccumulator();
         tickMap.put(reqId, acc);
 
-        // FIX: snapshot=false allows the use of generic tick '101'.
-        // Generic tick '101' (Option PV Dividend) forces IBKR to calculate the
-        // internal Greeks model (Field 13) even when the market is closed.
-        client.reqMktData(reqId, contract, "101", false, false, Collections.emptyList());
+        // Generic tick "106" (Option Implied Volatility) tells IBKR to run its
+        // Black-Scholes model for the contract even when the market is closed.
+        // This is what causes tick type 13 (MODEL_OPTION Greeks) to arrive for
+        // contracts that have no live bid/ask — the key for off-hours Greek data.
+        // "100" = Historical Volatility (helps model seed), "101" = Open Interest.
+        // snapshot=false: keep subscription open until cancelMktData so the full
+        // model burst (Greeks + IV) has time to arrive before the timeout fires.
+        client.reqMktData(reqId, contract, "100,101,106", false, false, Collections.emptyList());
 
         // Wait the full timeout window so Bid/Ask and Model Greeks all arrive before mapping.
         // tickSnapshotEnd or error callbacks may complete the future earlier if applicable.
