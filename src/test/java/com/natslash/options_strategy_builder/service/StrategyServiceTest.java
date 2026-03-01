@@ -15,14 +15,20 @@ import static org.assertj.core.api.Assertions.*;
 @ExtendWith(MockitoExtension.class)
 class StrategyServiceTest {
 
-    @Mock MarketDataService marketDataService;
+    @Mock MarketDataService    marketDataService;
     @Mock InstrumentRepository instrumentRepository;
+    @Mock IVRankService        ivRankService;
 
     StrategyService service;
 
     @BeforeEach
     void setUp() {
-        service = new StrategyService(marketDataService, instrumentRepository);
+        service = new StrategyService(
+                marketDataService,
+                instrumentRepository,
+                new ProbabilityEngine(),
+                new LiquidityScorer(),
+                ivRankService);
     }
 
     // ── analyze() — Greeks ────────────────────────────────────────────────

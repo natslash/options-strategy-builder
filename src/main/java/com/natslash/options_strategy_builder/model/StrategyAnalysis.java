@@ -28,4 +28,26 @@ public class StrategyAnalysis {
     private Double breakEvenHigh;
 
     private List<StrategyLeg> legs;
+
+    // Futures & basis
+    private Double futuresPrice;   // null if instrument has no futuresConId
+    private Double basisPct;       // (futures - spot) / spot * 100
+
+    // Volatility context
+    private Double ivRank;         // 0–1, null if IBKR unavailable
+    private String ivRankLabel;    // "LOW" / "MODERATE" / "ELEVATED" / "HIGH"
+    private Double hvRatio;        // IV/HV30 (>1.0 = selling edge)
+
+    // Probability & expected move (uses futuresPrice if available, else spot)
+    private Double expectedMoveUp;   // underlying + 1SD
+    private Double expectedMoveDown; // underlying - 1SD
+    private Double pop;              // 0–1 probability both break-evens hold
+    private boolean breakEvensSafe;  // true if both BEs are outside the 1-SD range
+
+    // Liquidity
+    private Double liquidityScore;   // 0–1, null if no bid/ask/OI in legs
+
+    // Risk flags
+    private boolean gammaRisk;   // abs(netGamma) > 0.005 AND minDte <= 5
+    private Integer minDte;      // minimum DTE across all legs
 }

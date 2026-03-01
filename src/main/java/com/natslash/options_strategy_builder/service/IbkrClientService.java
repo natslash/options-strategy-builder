@@ -3,6 +3,7 @@ package com.natslash.options_strategy_builder.service;
 import com.ib.client.*;
 import com.natslash.options_strategy_builder.config.IbkrProperties;
 import com.natslash.options_strategy_builder.model.ChainParams;
+import com.natslash.options_strategy_builder.model.HistoricalBar;
 import com.natslash.options_strategy_builder.model.TickData;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -123,6 +124,12 @@ public class IbkrClientService {
     public CompletableFuture<TickData> reqMktData(Contract contract, int timeoutMs) {
         if (!isConnected()) return CompletableFuture.completedFuture(TickData.EMPTY);
         return dispatcher.reqMktData(contract, timeoutMs);
+    }
+
+    public CompletableFuture<List<HistoricalBar>> reqHistoricalData(
+            Contract contract, String duration, String barSize, String whatToShow) {
+        if (!isConnected()) return CompletableFuture.completedFuture(List.of());
+        return dispatcher.reqHistoricalData(contract, duration, barSize, whatToShow);
     }
 
     private void requireConnected() {

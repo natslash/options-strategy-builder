@@ -107,6 +107,45 @@ class OptionsChainServiceTest {
                 .hasMessageContaining("No strikes available");
     }
 
+    // ── strikeWindow ──────────────────────────────────────────────────────
+
+    @Test
+    void strikeWindow_spotInMiddle_returnsExactCount() {
+        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
+        // spot=4.0 at idx=3, count=4 → half=2, from=max(0,3-2)=1, to=min(7,1+4)=5, from=max(0,5-4)=1
+        List<Double> result = OptionsChainService.strikeWindow(strikes, 4.0, 4);
+        assertThat(result).hasSize(4).containsExactly(2.0, 3.0, 4.0, 5.0);
+    }
+
+    @Test
+    void strikeWindow_spotAtMinimum_windowStartsAtIndex0() {
+        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0);
+        // spot below list → insertion point 0
+        List<Double> result = OptionsChainService.strikeWindow(strikes, 0.5, 3);
+        assertThat(result).hasSize(3).containsExactly(1.0, 2.0, 3.0);
+    }
+
+    @Test
+    void strikeWindow_spotAtMaximum_windowEndsAtLastIndex() {
+        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0);
+        // spot above list → insertion point = size → clamped to size-1
+        List<Double> result = OptionsChainService.strikeWindow(strikes, 6.0, 3);
+        assertThat(result).hasSize(3).containsExactly(3.0, 4.0, 5.0);
+    }
+
+    @Test
+    void strikeWindow_countExceedsListSize_returnsWholeList() {
+        List<Double> strikes = List.of(1.0, 2.0, 3.0);
+        List<Double> result = OptionsChainService.strikeWindow(strikes, 2.0, 10);
+        assertThat(result).hasSize(3).containsExactly(1.0, 2.0, 3.0);
+    }
+
+    @Test
+    void strikeWindow_emptyList_returnsEmpty() {
+        List<Double> result = OptionsChainService.strikeWindow(List.of(), 5000.0, 25);
+        assertThat(result).isEmpty();
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     private TickData tickWith(Double last, Double close) {

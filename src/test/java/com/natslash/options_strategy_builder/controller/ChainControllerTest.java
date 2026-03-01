@@ -5,6 +5,7 @@ import com.ib.client.ContractDetails;
 import com.ib.client.Types;
 import com.natslash.options_strategy_builder.entity.Instrument;
 import com.natslash.options_strategy_builder.repository.InstrumentRepository;
+import com.natslash.options_strategy_builder.service.ChainAnalysisService;
 import com.natslash.options_strategy_builder.service.IbkrClientService;
 import com.natslash.options_strategy_builder.service.IbkrHealthCheckService;
 import com.natslash.options_strategy_builder.service.OptionsChainService;
@@ -34,6 +35,7 @@ class ChainControllerTest {
 
     @MockitoBean IbkrClientService       ibkr;
     @MockitoBean OptionsChainService     chainService;
+    @MockitoBean ChainAnalysisService    chainAnalysisService;
     @MockitoBean InstrumentRepository    instrumentRepository;
     @MockitoBean IbkrHealthCheckService  healthService;
 
