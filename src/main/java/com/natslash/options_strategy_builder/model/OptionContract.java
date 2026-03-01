@@ -36,6 +36,8 @@ public class OptionContract {
     private Double otmPct;      // (strike - spot) / spot * 100
 
     // Metadata
+    private int    bidSize;
+    private int    askSize;
     private int    volume;
     private int    openInterest;
     private String greeksSource; // "IBKR" or "NONE"

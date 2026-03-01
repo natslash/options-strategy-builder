@@ -9,6 +9,7 @@ import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import org.springframework.scheduling.annotation.Scheduled;
 import java.util.List;
 import java.util.concurrent.*;
 
@@ -67,8 +68,25 @@ public class IbkrClientService {
     }
 
     @PostConstruct
-    public void init() throws InterruptedException {
-        connect();
+    public void init() {
+        try {
+            connect();
+        } catch (Exception e) {
+            log.warn("IB Gateway not available at {}:{}: {} — start IBGW and restart, or use cached data",
+                    props.getHost(), props.getPort(), e.getMessage());
+        }
+    }
+
+    @Scheduled(fixedDelay = 15_000)
+    public void reconnectIfDisconnected() {
+        if (isConnected()) return;
+        log.info("IBGW not connected — attempting reconnect...");
+        try {
+            connect();
+            log.info("Reconnected to IBGW successfully");
+        } catch (Exception e) {
+            log.debug("Reconnect attempt failed: {}", e.getMessage());
+        }
     }
 
     @PreDestroy
@@ -88,18 +106,28 @@ public class IbkrClientService {
     // ═══════════════════════════════════════════════════════════
 
     public void reqMarketDataType(int type) {
+        if (!isConnected()) return;
         dispatcher.reqMarketDataType(type);
     }
 
     public CompletableFuture<List<ContractDetails>> reqContractDetails(String symbol, String secType) {
+        requireConnected();
         return dispatcher.reqContractDetails(symbol, secType);
     }
 
     public CompletableFuture<ChainParams> reqChainParams(String symbol, String secType, int conId) {
+        requireConnected();
         return dispatcher.reqChainParams(symbol, secType, conId);
     }
 
     public CompletableFuture<TickData> reqMktData(Contract contract, int timeoutMs) {
+        if (!isConnected()) return CompletableFuture.completedFuture(TickData.EMPTY);
         return dispatcher.reqMktData(contract, timeoutMs);
+    }
+
+    private void requireConnected() {
+        if (!isConnected())
+            throw new IllegalStateException(
+                    "IB Gateway not connected — start IBGW at " + props.getHost() + ":" + props.getPort());
     }
 }

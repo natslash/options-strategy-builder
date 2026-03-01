@@ -71,7 +71,7 @@ class TickDataTest {
                 null, null, null, null,
                 null, null,
                 0.20, 0.5, 0.001, 0.05, -1.0,
-                0, 0, true);
+                0, 0, 0, 0, true);
         assertThat(tick.hasData()).isTrue();
     }
 
@@ -81,7 +81,7 @@ class TickDataTest {
                 null, null, null, null,
                 null, null,
                 null, null, null, null, null,
-                0, 0, false);
+                0, 0, 0, 0, false);
         assertThat(tick.hasData()).isFalse();
     }
 
@@ -94,6 +94,6 @@ class TickDataTest {
                 bid, ask, last, close,
                 null, null,
                 null, null, null, null, null,
-                0, 0, false);
+                0, 0, 0, 0, false);
     }
 }

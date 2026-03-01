@@ -28,6 +28,26 @@ public class TradingSchedule {
                 && timeNow <= 1730;
     }
 
+    /**
+     * Returns expiries within {@code maxDte} days matching the requested types.
+     * Set {@code includeMonthly} for third-Friday monthlies; {@code includeWeekly} for all other Fridays.
+     */
+    public List<String> filterExpiries(List<String> expirations, int maxDte,
+                                        boolean includeMonthly, boolean includeWeekly) {
+        LocalDate today  = LocalDate.now();
+        LocalDate maxDay = today.plusDays(maxDte);
+        return expirations.stream()
+                .filter(e -> {
+                    LocalDate d = LocalDate.parse(e, FMT);
+                    if (!d.isAfter(today) || d.isAfter(maxDay))  return false;
+                    if (d.getDayOfWeek() != DayOfWeek.FRIDAY)    return false;
+                    boolean monthly = isThirdFriday(d);
+                    return (monthly && includeMonthly) || (!monthly && includeWeekly);
+                })
+                .sorted()
+                .toList();
+    }
+
     /** Returns expiries that are monthly (third-Friday) and within {@code maxDte} days. */
     public List<String> filterMonthlyExpiries(List<String> expirations, int maxDte) {
         LocalDate today  = LocalDate.now();

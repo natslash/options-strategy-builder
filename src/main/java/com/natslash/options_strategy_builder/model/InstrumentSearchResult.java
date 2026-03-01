@@ -17,5 +17,6 @@ public class InstrumentSearchResult {
     private int     conId;
     private int     multiplier;
     private String  tradingClass;
+    private String  secType;
     private boolean alreadySaved;
 }

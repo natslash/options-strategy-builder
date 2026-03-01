@@ -20,6 +20,7 @@ public class Instrument {
     private Integer conId;
     private Integer multiplier;
     private String tradingClass;
+    private String secType;
     private Integer strikeRange;
     private Integer maxExpiries;
     private Boolean active = true;

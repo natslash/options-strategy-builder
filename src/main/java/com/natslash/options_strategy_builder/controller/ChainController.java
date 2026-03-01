@@ -1,19 +1,25 @@
 package com.natslash.options_strategy_builder.controller;
 
 import com.ib.client.ContractDetails;
+import com.ib.client.Types;
 import com.natslash.options_strategy_builder.entity.Instrument;
 import com.natslash.options_strategy_builder.model.InstrumentSearchResult;
+import com.natslash.options_strategy_builder.model.ChainFilterParams;
 import com.natslash.options_strategy_builder.model.OptionContract;
 import com.natslash.options_strategy_builder.repository.InstrumentRepository;
 import com.natslash.options_strategy_builder.service.IbkrClientService;
 import com.natslash.options_strategy_builder.service.OptionsChainService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 @Slf4j
 @RestController
@@ -25,6 +31,13 @@ public class ChainController {
     private final IbkrClientService ibkr;
     private final InstrumentRepository instrumentRepository;
 
+    // ── Status ─────────────────────────────────────────────────
+
+    @GetMapping("/status")
+    public Map<String, Boolean> getStatus() {
+        return Map.of("ibkrConnected", ibkr.isConnected());
+    }
+
     // ── Instruments ────────────────────────────────────────────
 
     @GetMapping("/instruments")
@@ -33,31 +46,54 @@ public class ChainController {
     }
 
     /**
-     * Search IBKR for index contracts matching a symbol.
+     * Search IBKR for index and stock contracts matching a symbol.
+     * Searches IND and STK in parallel, merges, deduplicates by conId.
      * GET /api/instruments/search?symbol=DAX
      */
     @GetMapping("/instruments/search")
     public ResponseEntity<List<InstrumentSearchResult>> searchInstruments(
-            @RequestParam String symbol) throws Exception {
+            @RequestParam String symbol) {
+        try {
+            String sym = symbol.toUpperCase();
+            // Run IND and STK searches in parallel — each may return 0 results without error
+            CompletableFuture<List<ContractDetails>> indFut = ibkr.reqContractDetails(sym, "IND")
+                    .exceptionally(e -> { log.debug("IND search for {} failed: {}", sym, e.getMessage()); return List.of(); });
+            CompletableFuture<List<ContractDetails>> stkFut = ibkr.reqContractDetails(sym, "STK")
+                    .exceptionally(e -> { log.debug("STK search for {} failed: {}", sym, e.getMessage()); return List.of(); });
 
-        List<ContractDetails> results = ibkr.reqContractDetails(symbol.toUpperCase(), "IND").join();
+            List<ContractDetails> ind = indFut.join();
+            List<ContractDetails> stk = stkFut.join();
+            log.info("Instrument search '{}': {} IND + {} STK results", sym, ind.size(), stk.size());
 
-        List<InstrumentSearchResult> response = results.stream()
-                .map(cd -> InstrumentSearchResult.builder()
-                        .symbol(cd.contract().symbol())
-                        .name(cd.longName())
-                        .exchange(cd.contract().exchange())
-                        .currency(cd.contract().currency())
-                        .conId(cd.contract().conid())
-                        .multiplier(parseMultiplier(cd.contract().multiplier()))
-                        .tradingClass(cd.contract().tradingClass())
-                        .alreadySaved(instrumentRepository
-                                .findBySymbolAndExchange(cd.contract().symbol(), cd.contract().exchange())
-                                .isPresent())
-                        .build())
-                .toList();
+            // Dedup by conId — IND first, then STK; keeps insertion order
+            LinkedHashMap<Integer, ContractDetails> deduped = new LinkedHashMap<>();
+            for (ContractDetails cd : ind) if (cd.contract().conid() > 0) deduped.putIfAbsent(cd.contract().conid(), cd);
+            for (ContractDetails cd : stk) if (cd.contract().conid() > 0) deduped.putIfAbsent(cd.contract().conid(), cd);
 
-        return ResponseEntity.ok(response);
+            // Only IND and STK have listed options — filter out anything else IBKR returns
+            List<InstrumentSearchResult> response = deduped.values().stream()
+                    .filter(cd -> cd.contract().secType() == Types.SecType.IND
+                               || cd.contract().secType() == Types.SecType.STK)
+                    .map(cd -> InstrumentSearchResult.builder()
+                            .symbol(cd.contract().symbol())
+                            .name(cd.longName())
+                            .exchange(cd.contract().exchange())
+                            .currency(cd.contract().currency())
+                            .conId(cd.contract().conid())
+                            .multiplier(parseMultiplier(cd.contract().multiplier()))
+                            .tradingClass(cd.contract().tradingClass())
+                            .secType(cd.contract().secType().name())   // enum → "IND" / "STK"
+                            .alreadySaved(instrumentRepository
+                                    .findBySymbolAndExchange(cd.contract().symbol(), cd.contract().exchange())
+                                    .isPresent())
+                            .build())
+                    .toList();
+
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.warn("Instrument search failed for {}: {}", symbol, e.getMessage());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        }
     }
 
     /**
@@ -70,8 +106,10 @@ public class ChainController {
         // Check if already exists
         var existing = instrumentRepository.findBySymbolAndExchange(req.getSymbol(), req.getExchange());
         if (existing.isPresent()) {
-            existing.get().setActive(true);
-            return ResponseEntity.ok(instrumentRepository.save(existing.get()));
+            Instrument inst = existing.get();
+            inst.setActive(true);
+            if (req.getSecType() != null) inst.setSecType(req.getSecType());
+            return ResponseEntity.ok(instrumentRepository.save(inst));
         }
 
         Instrument inst = new Instrument();
@@ -82,6 +120,7 @@ public class ChainController {
         inst.setConId(req.getConId());
         inst.setMultiplier(req.getMultiplier());
         inst.setTradingClass(req.getTradingClass());
+        inst.setSecType(req.getSecType());
         inst.setStrikeRange(10); // sensible default — user can adjust later
         inst.setMaxExpiries(3);
         inst.setActive(true);
@@ -89,19 +128,62 @@ public class ChainController {
         return ResponseEntity.ok(instrumentRepository.save(inst));
     }
 
-    // ── Chain ──────────────────────────────────────────────────
-    @GetMapping("/chain")
-    public ResponseEntity<List<OptionContract>> getChain(
-            @RequestParam Long instrumentId,
-            @RequestParam(required = false) Double spot,
-            @RequestParam(defaultValue = "false") boolean forceRefresh) throws Exception {
+    @DeleteMapping("/instruments/{id}")
+    public ResponseEntity<Void> removeInstrument(@PathVariable Long id) {
+        var opt = instrumentRepository.findById(id);
+        if (opt.isEmpty()) return ResponseEntity.notFound().build();
+        Instrument inst = opt.get();
+        inst.setActive(false);
+        instrumentRepository.save(inst);
+        return ResponseEntity.ok().build();
+    }
+
+    // ── Chain params (cheap: no tick data) ────────────────────
+    @GetMapping("/chain/params")
+    public ResponseEntity<ChainFilterParams> getChainParams(
+            @RequestParam Long instrumentId) {
 
         Instrument instrument = instrumentRepository.findById(instrumentId)
                 .orElseThrow(() -> new IllegalArgumentException("Instrument not found: " + instrumentId));
 
         try {
-            return ResponseEntity.ok(chainService.fetchChain(instrument, spot, forceRefresh));
-        } catch (RuntimeException e) {
+            return ResponseEntity.ok(chainService.fetchChainParams(instrument));
+        } catch (IllegalArgumentException e) {
+            // Instrument config problem (e.g. missing secType) — not a connection issue
+            log.warn("Instrument config error for {}: {}", instrument.getSymbol(), e.getMessage());
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage());
+        } catch (IllegalStateException e) {
+            log.warn("Chain params unavailable for {}: {}", instrument.getSymbol(), e.getMessage());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        } catch (Exception e) {
+            log.error("Failed to fetch chain params for {}", instrument.getSymbol(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+
+    // ── Chain (full fetch with filter params) ─────────────────
+    @GetMapping("/chain")
+    public ResponseEntity<List<OptionContract>> getChain(
+            @RequestParam Long instrumentId,
+            @RequestParam(required = false) Double spot,
+            @RequestParam(defaultValue = "false") boolean forceRefresh,
+            @RequestParam(required = false) String expiry,
+            @RequestParam(defaultValue = "true")   boolean includeMonthly,
+            @RequestParam(defaultValue = "false")  boolean includeWeekly,
+            @RequestParam(defaultValue = "ACTIVE") String  strikeFilter,
+            @RequestParam(defaultValue = "30.0")   double  strikeRangePct) throws Exception {
+
+        Instrument instrument = instrumentRepository.findById(instrumentId)
+                .orElseThrow(() -> new IllegalArgumentException("Instrument not found: " + instrumentId));
+
+        log.info("Chain request: instrumentId={} expiry={} spot={} strikeFilter={} strikeRangePct={} includeMonthly={} includeWeekly={}",
+                instrumentId, expiry, spot, strikeFilter, strikeRangePct, includeMonthly, includeWeekly);
+
+        try {
+            return ResponseEntity.ok(chainService.fetchChain(
+                    instrument, spot, forceRefresh, expiry,
+                    includeMonthly, includeWeekly, strikeFilter, strikeRangePct));
+        } catch (Exception e) {
             log.warn("Chain fetch failed for {}: {}", instrument.getSymbol(), e.getMessage());
             return ResponseEntity.ok(List.of());
         }

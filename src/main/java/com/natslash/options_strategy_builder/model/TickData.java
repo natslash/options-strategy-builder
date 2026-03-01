@@ -5,7 +5,13 @@ public record TickData(
         Double bid, Double ask, Double last, Double close,
         Double optPrice, Double undPrice,
         Double impliedVol, Double delta, Double gamma, Double vega, Double theta,
-        int volume, int openInterest, boolean greeksReceived) {
+        int bidSize, int askSize, int volume, int openInterest, boolean greeksReceived) {
+
+    /** Returned when IBGW is not connected — all fields null/zero/false. */
+    public static final TickData EMPTY = new TickData(
+            null, null, null, null, null, null,
+            null, null, null, null, null,
+            0, 0, 0, 0, false);
 
     public boolean hasData() {
         return bid != null || ask != null || last != null || close != null || greeksReceived;

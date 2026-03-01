@@ -35,3 +35,9 @@ sheets-mcp-credentials.json
 target/
 *.class
 *.jar
+
+# H2 local database (dev only)
+data/
+
+# Claude Code worktrees
+.claude/worktrees/

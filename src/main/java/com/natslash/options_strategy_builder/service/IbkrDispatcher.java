@@ -15,21 +15,23 @@ import java.util.concurrent.atomic.AtomicInteger;
  * routing callbacks to the correct pending-request accumulator via reqId, and
  * initiating typed requests through the shared EClientSocket.
  *
- * <p>Maps are private — callers interact only through the typed request methods.
- * {@link IbkrClientService} calls {@link #setClient} once the socket is connected.
+ * <p>
+ * Maps are private — callers interact only through the typed request methods.
+ * {@link IbkrClientService} calls {@link #setClient} once the socket is
+ * connected.
  */
 @Slf4j
 @Component
 public class IbkrDispatcher extends DefaultEWrapper {
 
-    final AtomicInteger         reqIdCounter  = new AtomicInteger(1);
-    CompletableFuture<Void>     connectFuture;
-    private EClientSocket       client;
+    final AtomicInteger reqIdCounter = new AtomicInteger(1);
+    CompletableFuture<Void> connectFuture;
+    private EClientSocket client;
 
     // ── Pending-request registries ─────────────────────────────
     private final Map<Integer, ContractDetailsAccumulator> contractDetailsMap = new ConcurrentHashMap<>();
-    private final Map<Integer, ChainParamsAccumulator>     chainParamMap      = new ConcurrentHashMap<>();
-    private final Map<Integer, TickAccumulator>            tickMap            = new ConcurrentHashMap<>();
+    private final Map<Integer, ChainParamsAccumulator> chainParamMap = new ConcurrentHashMap<>();
+    private final Map<Integer, TickAccumulator> tickMap = new ConcurrentHashMap<>();
 
     // ── Connection lifecycle ───────────────────────────────────
 
@@ -37,7 +39,9 @@ public class IbkrDispatcher extends DefaultEWrapper {
         connectFuture = new CompletableFuture<>();
     }
 
-    /** Called by {@link IbkrClientService} immediately after the socket connects. */
+    /**
+     * Called by {@link IbkrClientService} immediately after the socket connects.
+     */
     void setClient(EClientSocket client) {
         this.client = client;
     }
@@ -84,7 +88,8 @@ public class IbkrDispatcher extends DefaultEWrapper {
                     return list;
                 })
                 .whenComplete((r, ex) -> {
-                    if (ex != null) log.warn("reqContractDetails failed for {}: {}", symbol, ex.getMessage());
+                    if (ex != null)
+                        log.warn("reqContractDetails failed for {}: {}", symbol, ex.getMessage());
                     contractDetailsMap.remove(reqId);
                 });
     }
@@ -108,29 +113,37 @@ public class IbkrDispatcher extends DefaultEWrapper {
                     return new ChainParams(new ArrayList<>(a.expirations), new ArrayList<>(a.strikes));
                 })
                 .whenComplete((r, ex) -> {
-                    if (ex != null) log.warn("reqChainParams failed: {}", ex.getMessage());
+                    if (ex != null)
+                        log.warn("reqChainParams failed: {}", ex.getMessage());
                     chainParamMap.remove(reqId);
                 });
     }
 
     /**
-     * Returns a future that always completes normally within {@code timeoutMs}.
-     * If tickSnapshotEnd does not arrive in time, completes with whatever tick
-     * data was received so far (partial data is acceptable for chain scanning).
+     * Requests market data for a specific contract and gathers results over a time
+     * window.
+     * * @param contract The option or index contract to fetch
+     * 
+     * @param timeoutMs The window (e.g., 1000-1500ms) to wait for the data burst to
+     *                  complete
+     * @return A future containing the aggregated TickData
      */
     public CompletableFuture<TickData> reqMktData(Contract contract, int timeoutMs) {
-        int reqId = nextReqId();
+        int reqId = reqIdCounter.getAndIncrement();
         TickAccumulator acc = new TickAccumulator();
         tickMap.put(reqId, acc);
 
-        client.reqMktData(reqId, contract, "", false, false, Collections.emptyList());
+        // FIX: snapshot=false allows the use of generic tick '101'.
+        // Generic tick '101' (Option PV Dividend) forces IBKR to calculate the
+        // internal Greeks model (Field 13) even when the market is closed.
+        client.reqMktData(reqId, contract, "101", false, false, Collections.emptyList());
+
+        // Wait the full timeout window so Bid/Ask and Model Greeks all arrive before mapping.
+        // tickSnapshotEnd or error callbacks may complete the future earlier if applicable.
         acc.future.completeOnTimeout(acc, timeoutMs, TimeUnit.MILLISECONDS);
 
         return acc.future
-                .thenApply(a -> new TickData(
-                        a.bid, a.ask, a.last, a.close, a.optPrice, a.undPrice,
-                        a.impliedVol, a.delta, a.gamma, a.vega, a.theta,
-                        a.volume, a.openInterest, a.greeksReceived))
+                .thenApply(this::mapToTickData)
                 .whenComplete((r, ex) -> {
                     client.cancelMktData(reqId);
                     tickMap.remove(reqId);
@@ -161,7 +174,8 @@ public class IbkrDispatcher extends DefaultEWrapper {
             String tradingClass, String multiplier,
             Set<String> expirations, Set<Double> strikes) {
         ChainParamsAccumulator acc = chainParamMap.get(reqId);
-        if (acc == null) return;
+        if (acc == null)
+            return;
         acc.expirations.addAll(expirations);
         acc.strikes.addAll(strikes);
     }
@@ -178,43 +192,67 @@ public class IbkrDispatcher extends DefaultEWrapper {
     @Override
     public void tickPrice(int reqId, int field, double price, TickAttrib attrib) {
         TickAccumulator acc = tickMap.get(reqId);
-        if (acc == null || price <= 0) return;
+        if (acc == null || price <= 0)
+            return;
         switch (field) {
-            case 1 -> acc.bid   = price;
-            case 2 -> acc.ask   = price;
-            case 4 -> acc.last  = price;
+            case 1 -> acc.bid = price;
+            case 2 -> acc.ask = price;
+            case 4 -> acc.last = price;
             case 9 -> acc.close = price;
         }
-        if (field == 1 || field == 2 || field == 4 || field == 9)
-            acc.priceReceived = true;
     }
 
     @Override
     public void tickSize(int reqId, int field, Decimal size) {
         TickAccumulator acc = tickMap.get(reqId);
-        if (acc == null) return;
+        if (acc == null)
+            return;
         switch (field) {
-            case 8  -> acc.volume       = (int) size.longValue();
+            case 0 -> acc.bidSize = (int) size.longValue();
+            case 3 -> acc.askSize = (int) size.longValue();
+            case 8 -> acc.volume = (int) size.longValue();
             case 22 -> acc.openInterest = (int) size.longValue();
         }
     }
 
+    /**
+     * Callback for option-specific calculations (Greeks and Model IV).
+     * During off-hours, we specifically look for Field 13 (MODEL_OPTION).
+     */
     @Override
-    public void tickOptionComputation(
-            int reqId, int field, int tickAttrib,
-            double impliedVol, double delta, double optPrice,
-            double pvDividend, double gamma, double vega, double theta,
-            double undPrice) {
-        TickAccumulator acc = tickMap.get(reqId);
-        if (acc == null) return;
-        if (impliedVol > 0 && impliedVol < 10 && impliedVol != Double.MAX_VALUE) acc.impliedVol = impliedVol;
-        if (delta    != Double.MAX_VALUE && delta    != -Double.MAX_VALUE) acc.delta    = delta;
-        if (gamma    != Double.MAX_VALUE && gamma    != -Double.MAX_VALUE) acc.gamma    = gamma;
-        if (vega     != Double.MAX_VALUE && vega     != -Double.MAX_VALUE) acc.vega     = vega;
-        if (theta    != Double.MAX_VALUE && theta    != -Double.MAX_VALUE) acc.theta    = theta;
-        if (undPrice > 0 && undPrice != Double.MAX_VALUE)                  acc.undPrice = undPrice;
-        if (optPrice > 0 && optPrice != Double.MAX_VALUE)                  acc.optPrice = optPrice;
-        if (field == 13) acc.greeksReceived = true;
+    public void tickOptionComputation(int tickerId, int field, int tickAttrib, double impliedVol,
+            double delta, double optPrice, double pvDividend, double gamma,
+            double vega, double theta, double undPrice) {
+        TickAccumulator acc = tickMap.get(tickerId);
+        if (acc == null)
+            return;
+
+        // Field 13 = Model calculation (Server-side Black-Scholes)
+        // Field 10/11 = Bid/Ask based Greeks (Only available during market hours)
+        if (field == 13 || field == 10 || field == 11) {
+            // IBKR returns -1 or -2 for values that aren't yet calculated; we filter those
+            // out.
+            if (impliedVol > 0)
+                acc.impliedVol = impliedVol;
+            if (delta >= -1 && delta <= 1)
+                acc.delta = delta;
+            if (gamma > -2)
+                acc.gamma = gamma;
+            if (vega > -2)
+                acc.vega = vega;
+            if (theta > -2)
+                acc.theta = theta;
+            if (optPrice > 0)
+                acc.optPrice = optPrice;
+            if (undPrice > 0)
+                acc.undPrice = undPrice;
+
+            // Mark that we have at least one successful Greek data point
+            acc.greeksReceived = true;
+
+            // NOTE: We no longer call acc.future.complete() here.
+            // The reqMktData timeout now handles the completion.
+        }
     }
 
     @Override
@@ -224,25 +262,78 @@ public class IbkrDispatcher extends DefaultEWrapper {
             acc.future.complete(acc);
     }
 
+    @Override
+    public void marketDataType(int reqId, int marketDataType) {
+        // 1 = Live (Real-time)
+        // 2 = Frozen (Last-known price from close)
+        // 3 = Delayed (15-min lag)
+        // 4 = Delayed Frozen (Last-known price from delayed stream)
+
+        String typeStr = switch (marketDataType) {
+            case 1 -> "LIVE";
+            case 2 -> "FROZEN";
+            case 3 -> "DELAYED";
+            case 4 -> "DELAYED_FROZEN";
+            default -> "UNKNOWN (" + marketDataType + ")";
+        };
+
+        log.debug(">>> SUBSCRIPTION CHECK: ReqId {} is receiving {} data", reqId, typeStr);
+
+        if (marketDataType >= 3) {
+            log.error("PERMISSIONS ALERT: ReqId {} is being downgraded to DELAYED. " +
+                    "This confirms IBKR does not recognize your real-time subscription " +
+                    "for this specific exchange/instrument.", reqId);
+        }
+    }
+
     // ── Error handling ─────────────────────────────────────────
 
     @Override
     public void error(int id, long errorTime, int errorCode, String errorMsg, String advancedOrderRejectJson) {
-        if (isSuppress(errorCode)) return;
+        if (isSuppress(errorCode))
+            return;
         if (errorCode == 200) {
             // Contract not found — unblock waiting futures with empty/partial results
             ContractDetailsAccumulator cdAcc = contractDetailsMap.remove(id);
-            if (cdAcc != null) cdAcc.future.complete(cdAcc);
+            if (cdAcc != null)
+                cdAcc.future.complete(cdAcc);
             TickAccumulator tickAcc = tickMap.remove(id);
-            if (tickAcc != null) tickAcc.future.complete(tickAcc);
+            if (tickAcc != null)
+                tickAcc.future.complete(tickAcc);
+            return;
+        }
+        // Unblock tick futures for any error so they don't wait for timeoutMs
+        TickAccumulator tickAcc = tickMap.get(id);
+        if (tickAcc != null) {
+            log.warn("IBKR tick error id={} code={} msg={}", id, errorCode, errorMsg);
+            tickMap.remove(id);
+            tickAcc.future.complete(tickAcc);
             return;
         }
         log.warn("IBKR error id={} code={} msg={}", id, errorCode, errorMsg);
     }
 
-    @Override public void error(String str)    { log.warn("IBKR: {}", str); }
-    @Override public void error(Exception e)   { log.error("IBKR exception", e); }
-    @Override public void connectionClosed()   { log.warn("IBKR connection closed"); }
+    @Override
+    public void error(String str) {
+        log.warn("IBKR: {}", str);
+    }
+
+    @Override
+    public void error(Exception e) {
+        log.error("IBKR exception", e);
+    }
+
+    @Override
+    public void connectionClosed() {
+        log.warn("IBKR connection closed");
+    }
+
+    private TickData mapToTickData(TickAccumulator a) {
+        return new TickData(
+                a.bid, a.ask, a.last, a.close, a.optPrice, a.undPrice,
+                a.impliedVol, a.delta, a.gamma, a.vega, a.theta,
+                a.bidSize, a.askSize, a.volume, a.openInterest, a.greeksReceived);
+    }
 
     private boolean isSuppress(long code) {
         return code == 2104 || code == 2106 || code == 2158 || code == 2119
@@ -259,16 +350,15 @@ public class IbkrDispatcher extends DefaultEWrapper {
 
     static class ChainParamsAccumulator {
         final Set<String> expirations = ConcurrentHashMap.newKeySet();
-        final Set<Double> strikes     = ConcurrentHashMap.newKeySet();
+        final Set<Double> strikes = ConcurrentHashMap.newKeySet();
         final CompletableFuture<ChainParamsAccumulator> future = new CompletableFuture<>();
     }
 
     static class TickAccumulator {
         volatile Double bid, ask, last, close, optPrice, undPrice;
         volatile Double impliedVol, delta, gamma, vega, theta;
-        volatile int    volume, openInterest;
+        volatile int bidSize, askSize, volume, openInterest;
         volatile boolean greeksReceived;
-        volatile boolean priceReceived;
         final CompletableFuture<TickAccumulator> future = new CompletableFuture<>();
     }
 }
