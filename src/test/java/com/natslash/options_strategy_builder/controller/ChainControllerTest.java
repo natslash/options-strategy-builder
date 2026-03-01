@@ -6,6 +6,7 @@ import com.ib.client.Types;
 import com.natslash.options_strategy_builder.entity.Instrument;
 import com.natslash.options_strategy_builder.repository.InstrumentRepository;
 import com.natslash.options_strategy_builder.service.IbkrClientService;
+import com.natslash.options_strategy_builder.service.IbkrHealthCheckService;
 import com.natslash.options_strategy_builder.service.OptionsChainService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,9 +32,10 @@ class ChainControllerTest {
 
     @Autowired MockMvc mockMvc;
 
-    @MockitoBean IbkrClientService    ibkr;
-    @MockitoBean OptionsChainService  chainService;
-    @MockitoBean InstrumentRepository instrumentRepository;
+    @MockitoBean IbkrClientService       ibkr;
+    @MockitoBean OptionsChainService     chainService;
+    @MockitoBean InstrumentRepository    instrumentRepository;
+    @MockitoBean IbkrHealthCheckService  healthService;
 
     // ── Helpers ────────────────────────────────────────────────
 

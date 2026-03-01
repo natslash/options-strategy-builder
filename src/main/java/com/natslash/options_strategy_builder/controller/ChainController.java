@@ -6,8 +6,10 @@ import com.natslash.options_strategy_builder.entity.Instrument;
 import com.natslash.options_strategy_builder.model.InstrumentSearchResult;
 import com.natslash.options_strategy_builder.model.ChainFilterParams;
 import com.natslash.options_strategy_builder.model.OptionContract;
+import com.natslash.options_strategy_builder.model.IbkrHealthStatus;
 import com.natslash.options_strategy_builder.repository.InstrumentRepository;
 import com.natslash.options_strategy_builder.service.IbkrClientService;
+import com.natslash.options_strategy_builder.service.IbkrHealthCheckService;
 import com.natslash.options_strategy_builder.service.OptionsChainService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,6 +32,7 @@ public class ChainController {
     private final OptionsChainService chainService;
     private final IbkrClientService ibkr;
     private final InstrumentRepository instrumentRepository;
+    private final IbkrHealthCheckService healthService;
 
     // ── Status ─────────────────────────────────────────────────
 
@@ -176,6 +179,13 @@ public class ChainController {
         Instrument instrument = instrumentRepository.findById(instrumentId)
                 .orElseThrow(() -> new IllegalArgumentException("Instrument not found: " + instrumentId));
 
+        // Gate: cached health check (30s TTL) before expensive chain fetch
+        IbkrHealthStatus health = healthService.getHealth();
+        if (!health.healthy()) {
+            log.warn("Chain request rejected — IBKR unhealthy: {}", health.detail());
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
+        }
+
         log.info("Chain request: instrumentId={} expiry={} spot={} strikeFilter={} strikeRangePct={} includeMonthly={} includeWeekly={}",
                 instrumentId, expiry, spot, strikeFilter, strikeRangePct, includeMonthly, includeWeekly);
 
@@ -184,8 +194,8 @@ public class ChainController {
                     instrument, spot, forceRefresh, expiry,
                     includeMonthly, includeWeekly, strikeFilter, strikeRangePct));
         } catch (Exception e) {
-            log.warn("Chain fetch failed for {}: {}", instrument.getSymbol(), e.getMessage());
-            return ResponseEntity.ok(List.of());
+            log.error("Chain fetch failed for {}: {}", instrument.getSymbol(), e.getMessage(), e);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
     }
 
