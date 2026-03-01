@@ -27,6 +27,7 @@ public class OptionsChainService {
     private static final int    WINDOW_MS              = 1500;
     private static final int    MAX_DTE_DAYS           = 180;
     private static final long   PARAMS_CACHE_TTL_MS    = 60 * 60 * 1000L; // 1 hour
+    static final int            DEFAULT_STRIKE_COUNT   = 25;
     private static final DateTimeFormatter FMT         = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     // IBKR market data types
@@ -78,10 +79,11 @@ public class OptionsChainService {
         List<String> expiries = params.expirations().stream().sorted().toList();
         DoubleSummaryStatistics stats = params.strikes().stream()
                 .mapToDouble(Double::doubleValue).summaryStatistics();
-        log.info("ChainParams for {}: {} expiries, strikes {}-{}, spot={}",
-                instrument.getSymbol(), expiries.size(), stats.getMin(), stats.getMax(), spot);
+        List<Double> windowStrikes = strikeWindow(sortedStrikes, spot, DEFAULT_STRIKE_COUNT);
+        log.info("ChainParams for {}: {} expiries, strikes {}-{}, spot={}, window={}",
+                instrument.getSymbol(), expiries.size(), stats.getMin(), stats.getMax(), spot, windowStrikes.size());
         return new ChainFilterParams(spot, expiries, stats.getMin(), stats.getMax(),
-                (int) stats.getCount());
+                (int) stats.getCount(), windowStrikes);
     }
 
     /**
@@ -124,7 +126,7 @@ public class OptionsChainService {
     public List<OptionContract> fetchChain(Instrument instrument, Double providedSpot,
                                             boolean forceRefresh, String expiry,
                                             boolean includeMonthly, boolean includeWeekly,
-                                            String strikeFilter, double strikeRangePct)
+                                            String strikeFilter, int strikeCount)
             throws Exception {
 
         // 1. Set market data type — frozen outside hours so we get last known prices
@@ -146,7 +148,7 @@ public class OptionsChainService {
         // Frozen mode needs extra time for the model calculation to arrive
         int tickTimeout = marketHours ? WINDOW_MS : WINDOW_MS + 500;
         List<OptionContract> contracts = fetchFromIbkr(
-                instrument, params, spot, expiry, includeMonthly, includeWeekly, strikeFilter, strikeRangePct, tickTimeout, marketHours);
+                instrument, params, spot, expiry, includeMonthly, includeWeekly, strikeFilter, strikeCount, tickTimeout, marketHours);
 
         // 5. Reset to live data
         ibkr.reqMarketDataType(MDT_LIVE);
@@ -219,7 +221,7 @@ public class OptionsChainService {
                                                 boolean includeMonthly,
                                                 boolean includeWeekly,
                                                 String strikeFilter,
-                                                double strikeRangePct,
+                                                int strikeCount,
                                                 int tickTimeoutMs,
                                                 boolean marketHours) {
         long fetchStart = System.currentTimeMillis();
@@ -237,19 +239,18 @@ public class OptionsChainService {
         }
         log.info("Expiries ({}): {}", expiries.size(), expiries);
 
-        // Filter strikes: ACTIVE = within ±strikeRangePct of spot; ALL = every theoretical strike
+        // Filter strikes: ACTIVE = index-based ±N/2 window centred on ATM; ALL = every theoretical strike
         List<Double> allAvailableStrikes = params.strikes().stream().sorted().toList();
         log.info("IBKR strikes available: {} total, range {}-{}",
                 allAvailableStrikes.size(),
                 allAvailableStrikes.isEmpty() ? "n/a" : allAvailableStrikes.get(0),
                 allAvailableStrikes.isEmpty() ? "n/a" : allAvailableStrikes.get(allAvailableStrikes.size() - 1));
 
-        List<Double> strikes = allAvailableStrikes.stream()
-                .filter(s -> "ALL".equals(strikeFilter)
-                             || Math.abs(s - spot) / spot * 100.0 <= strikeRangePct)
-                .toList();
-        log.info("Spot={} strikeFilter={} pct={} → {} strikes (min={} max={})",
-                spot, strikeFilter, strikeRangePct, strikes.size(),
+        List<Double> strikes = "ALL".equals(strikeFilter)
+                ? allAvailableStrikes
+                : strikeWindow(allAvailableStrikes, spot, strikeCount);
+        log.info("Spot={} strikeFilter={} count={} → {} strikes (min={} max={})",
+                spot, strikeFilter, strikeCount, strikes.size(),
                 strikes.isEmpty() ? "n/a" : strikes.get(0),
                 strikes.isEmpty() ? "n/a" : strikes.get(strikes.size() - 1));
 
@@ -401,4 +402,28 @@ public class OptionsChainService {
     }
 
     private record ContractRequest(String expiry, double strike, String type) {}
+
+    // ═══════════════════════════════════════════════════════════
+    // Strike window helper
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Returns a sub-list of {@code count} strikes centred on the ATM strike (binary search).
+     * Package-private for unit testing.
+     *
+     * @param sorted ascending-sorted strike list from IBKR
+     * @param spot   current underlying price
+     * @param count  total desired window size, centred on ATM (count/2 below + count/2 above, clamped to list bounds)
+     */
+    static List<Double> strikeWindow(List<Double> sorted, double spot, int count) {
+        if (sorted.isEmpty() || count <= 0) return Collections.emptyList();
+        int idx = Collections.binarySearch(sorted, spot);
+        if (idx < 0) idx = ~idx;                   // insertion point when not found
+        idx = Math.min(idx, sorted.size() - 1);    // clamp to last element
+        int half = count / 2;
+        int from = Math.max(0, idx - half);
+        int to   = Math.min(sorted.size(), from + count);
+        from     = Math.max(0, to - count);         // re-anchor from when we hit the end
+        return List.copyOf(sorted.subList(from, to));
+    }
 }

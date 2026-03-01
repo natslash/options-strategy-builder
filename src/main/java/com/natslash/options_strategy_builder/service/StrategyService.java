@@ -7,6 +7,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 @Slf4j
@@ -14,17 +16,23 @@ import java.util.*;
 @RequiredArgsConstructor
 public class StrategyService {
 
+    private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
+
     private final MarketDataService    marketDataService;
     private final InstrumentRepository instrumentRepository;
+    private final ProbabilityEngine    probabilityEngine;
+    private final LiquidityScorer      liquidityScorer;
+    private final IVRankService        ivRankService;
 
     // ═══════════════════════════════════════════════════════════
     // Analyze
     // ═══════════════════════════════════════════════════════════
 
     public StrategyAnalysis analyze(StrategyRequest req) {
-        List<StrategyLeg> legs       = req.getLegs();
-        double            spot       = req.getSpot();
-        int               multiplier = resolveMultiplier(req);
+        List<StrategyLeg> legs = req.getLegs() != null ? req.getLegs() : List.of();
+        Double liveSpot = marketDataService.getSpot(req.getInstrumentId());
+        double spot     = (liveSpot != null && liveSpot > 0) ? liveSpot : req.getSpot();
+        int    multiplier = resolveMultiplier(req);
 
         // Net Greeks
         double netDelta = 0, netGamma = 0, netTheta = 0, netVega = 0, netPremium = 0;
@@ -69,6 +77,57 @@ public class StrategyService {
             }
         }
 
+        // ── New fields ─────────────────────────────────────────
+
+        // Futures price (cached 60s) — non-blocking fallback to spot
+        Double futuresPrice = marketDataService.getFuturesPrice(req.getInstrumentId());
+        Double basisPct = (futuresPrice != null && spot > 0)
+                ? (futuresPrice - spot) / spot * 100.0 : null;
+
+        // IV Rank (cached 4hr) — null-safe, never blocks analyze() on failure
+        IVRankResult ivRankResult = fetchIVRankSafely(req.getInstrumentId());
+        Double ivRank      = ivRankResult != null ? ivRankResult.ivRank()    : null;
+        String ivRankLabel = ivRankResult != null ? ivRankResult.label()     : null;
+        Double hvRatio     = ivRankResult != null ? ivRankResult.hvRatio()   : null;
+
+        // Minimum DTE across legs
+        Integer minDte = legs.stream()
+                .filter(l -> l.getExpiry() != null)
+                .mapToInt(l -> daysToExpiry(l.getExpiry()))
+                .filter(d -> d >= 0)
+                .min()
+                .stream().boxed().findFirst().orElse(null);
+
+        // Average IV across legs with non-null IV (stored as %; convert to fraction for BS)
+        OptionalDouble avgIvOpt = legs.stream()
+                .filter(l -> l.getIv() != null && l.getIv() > 0)
+                .mapToDouble(l -> l.getIv() / 100.0)
+                .average();
+
+        // Expected move and probability (requires avgIV and minDte)
+        double underlying = futuresPrice != null ? futuresPrice : spot;
+        Double expectedMoveUp   = null;
+        Double expectedMoveDown = null;
+        Double pop              = null;
+        boolean breakEvensSafe  = false;
+
+        if (avgIvOpt.isPresent() && minDte != null && minDte > 0) {
+            double em = probabilityEngine.expectedMove(underlying, avgIvOpt.getAsDouble(), minDte);
+            expectedMoveUp   = underlying + em;
+            expectedMoveDown = underlying - em;
+
+            if (breakEvenLow != null && breakEvenHigh != null) {
+                pop = probabilityEngine.probabilityBetween(breakEvenLow, breakEvenHigh, underlying, em);
+                breakEvensSafe = breakEvenLow < expectedMoveDown && breakEvenHigh > expectedMoveUp;
+            }
+        }
+
+        // Liquidity score
+        Double liquidityScore = liquidityScorer.score(legs);
+
+        // Gamma risk flag
+        boolean gammaRisk = Math.abs(netGamma) > 0.005 && minDte != null && minDte <= 5;
+
         return StrategyAnalysis.builder()
                 .name(req.getName())
                 .spot(spot)
@@ -83,6 +142,18 @@ public class StrategyService {
                 .breakEvenLow(breakEvenLow)
                 .breakEvenHigh(breakEvenHigh)
                 .legs(legs)
+                .futuresPrice(futuresPrice)
+                .basisPct(basisPct != null ? round(basisPct) : null)
+                .ivRank(ivRank)
+                .ivRankLabel(ivRankLabel)
+                .hvRatio(hvRatio)
+                .expectedMoveUp(expectedMoveUp)
+                .expectedMoveDown(expectedMoveDown)
+                .pop(pop)
+                .breakEvensSafe(breakEvensSafe)
+                .liquidityScore(liquidityScore)
+                .gammaRisk(gammaRisk)
+                .minDte(minDte)
                 .build();
     }
 
@@ -167,6 +238,23 @@ public class StrategyService {
     // ═══════════════════════════════════════════════════════════
 
     /**
+     * Fetches IV rank for the given instrument without throwing.
+     * Returns null when instrumentId is null, instrument not found, or IBKR unavailable.
+     */
+    private IVRankResult fetchIVRankSafely(Long instrumentId) {
+        if (instrumentId == null) return null;
+        try {
+            Instrument instrument = instrumentRepository.findById(instrumentId).orElse(null);
+            if (instrument == null) return null;
+            return ivRankService.getIVRank(instrument);
+        } catch (Exception e) {
+            log.warn("IV rank fetch failed for instrumentId={} — continuing without it: {}",
+                    instrumentId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * Snaps leg strikes to the nearest available strike returned by MarketDataService.
      * No-ops silently when instrumentId is null or strikes are unavailable.
      */
@@ -199,6 +287,16 @@ public class StrategyService {
         return "C".equals(leg.getType())
                 ? Math.max(0, spot - leg.getStrike())
                 : Math.max(0, leg.getStrike() - spot);
+    }
+
+    private int daysToExpiry(String expiry) {
+        try {
+            LocalDate expDate = LocalDate.parse(expiry, FMT);
+            return (int) (expDate.toEpochDay() - LocalDate.now().toEpochDay());
+        } catch (Exception e) {
+            log.warn("Could not parse expiry '{}': {}", expiry, e.getMessage());
+            return -1;
+        }
     }
 
     private double round(double v) {

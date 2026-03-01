@@ -24,6 +24,7 @@ public class Instrument {
     private Integer strikeRange;
     private Integer maxExpiries;
     private Boolean active = true;
+    private Integer futuresConId;   // conId of the front-month future (null = not applicable)
 
     @Column(updatable = false)
     private LocalDateTime createdAt = LocalDateTime.now();

@@ -15,4 +15,10 @@ public class StrategyLeg {
     private Double theta;
     private Double vega;
     private Double iv;
+
+    // Optional liquidity fields — populated by frontend from chain data when available
+    private Double  bid;
+    private Double  ask;
+    private Integer volume;
+    private Integer openInterest;
 }

@@ -3,11 +3,13 @@ package com.natslash.options_strategy_builder.controller;
 import com.ib.client.ContractDetails;
 import com.ib.client.Types;
 import com.natslash.options_strategy_builder.entity.Instrument;
+import com.natslash.options_strategy_builder.model.ChainAnalysisResult;
 import com.natslash.options_strategy_builder.model.InstrumentSearchResult;
 import com.natslash.options_strategy_builder.model.ChainFilterParams;
 import com.natslash.options_strategy_builder.model.OptionContract;
 import com.natslash.options_strategy_builder.model.IbkrHealthStatus;
 import com.natslash.options_strategy_builder.repository.InstrumentRepository;
+import com.natslash.options_strategy_builder.service.ChainAnalysisService;
 import com.natslash.options_strategy_builder.service.IbkrClientService;
 import com.natslash.options_strategy_builder.service.IbkrHealthCheckService;
 import com.natslash.options_strategy_builder.service.OptionsChainService;
@@ -30,6 +32,7 @@ import java.util.concurrent.CompletableFuture;
 public class ChainController {
 
     private final OptionsChainService chainService;
+    private final ChainAnalysisService chainAnalysisService;
     private final IbkrClientService ibkr;
     private final InstrumentRepository instrumentRepository;
     private final IbkrHealthCheckService healthService;
@@ -174,7 +177,7 @@ public class ChainController {
             @RequestParam(defaultValue = "true")   boolean includeMonthly,
             @RequestParam(defaultValue = "false")  boolean includeWeekly,
             @RequestParam(defaultValue = "ACTIVE") String  strikeFilter,
-            @RequestParam(defaultValue = "30.0")   double  strikeRangePct) throws Exception {
+            @RequestParam(defaultValue = "25")     int     strikeCount) throws Exception { // must match OptionsChainService.DEFAULT_STRIKE_COUNT
 
         Instrument instrument = instrumentRepository.findById(instrumentId)
                 .orElseThrow(() -> new IllegalArgumentException("Instrument not found: " + instrumentId));
@@ -186,17 +189,37 @@ public class ChainController {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
         }
 
-        log.info("Chain request: instrumentId={} expiry={} spot={} strikeFilter={} strikeRangePct={} includeMonthly={} includeWeekly={}",
-                instrumentId, expiry, spot, strikeFilter, strikeRangePct, includeMonthly, includeWeekly);
+        log.info("Chain request: instrumentId={} expiry={} spot={} strikeFilter={} strikeCount={} includeMonthly={} includeWeekly={}",
+                instrumentId, expiry, spot, strikeFilter, strikeCount, includeMonthly, includeWeekly);
 
         try {
             return ResponseEntity.ok(chainService.fetchChain(
                     instrument, spot, forceRefresh, expiry,
-                    includeMonthly, includeWeekly, strikeFilter, strikeRangePct));
+                    includeMonthly, includeWeekly, strikeFilter, strikeCount));
         } catch (Exception e) {
             log.error("Chain fetch failed for {}: {}", instrument.getSymbol(), e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
         }
+    }
+
+    // ── Chain analysis (max pain / PCR / OI walls) ────────────
+
+    /**
+     * POST /api/chain/{instrumentId}/analysis
+     * Accepts a pre-fetched chain and returns max pain, PCR, and OI walls.
+     * No IBKR call — pure calculation on provided chain data.
+     */
+    @PostMapping("/chain/{instrumentId}/analysis")
+    public ResponseEntity<ChainAnalysisResult> analyzeChain(
+            @PathVariable Long instrumentId,
+            @RequestBody List<OptionContract> chain) {
+
+        if (chain == null || chain.isEmpty())
+            return ResponseEntity.badRequest().build();
+
+        log.info("Chain analysis requested: instrumentId={} contracts={}", instrumentId, chain.size());
+        ChainAnalysisResult result = chainAnalysisService.analyze(chain);
+        return ResponseEntity.ok(result);
     }
 
     // ── Helpers ────────────────────────────────────────────────

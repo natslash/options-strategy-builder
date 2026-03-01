@@ -2,6 +2,7 @@ package com.natslash.options_strategy_builder.service;
 
 import com.ib.client.*;
 import com.natslash.options_strategy_builder.model.ChainParams;
+import com.natslash.options_strategy_builder.model.HistoricalBar;
 import com.natslash.options_strategy_builder.model.TickData;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -32,6 +33,7 @@ public class IbkrDispatcher extends DefaultEWrapper {
     private final Map<Integer, ContractDetailsAccumulator> contractDetailsMap = new ConcurrentHashMap<>();
     private final Map<Integer, ChainParamsAccumulator> chainParamMap = new ConcurrentHashMap<>();
     private final Map<Integer, TickAccumulator> tickMap = new ConcurrentHashMap<>();
+    private final Map<Integer, HistoricalDataAccumulator> historicalDataMap = new ConcurrentHashMap<>();
 
     // ── Connection lifecycle ───────────────────────────────────
 
@@ -147,6 +149,30 @@ public class IbkrDispatcher extends DefaultEWrapper {
                 .whenComplete((r, ex) -> {
                     client.cancelMktData(reqId);
                     tickMap.remove(reqId);
+                });
+    }
+
+    /**
+     * Requests historical data for a contract and collects bars until the end callback.
+     * Completes with all bars or times out after 30 s.
+     */
+    public CompletableFuture<List<HistoricalBar>> reqHistoricalData(
+            Contract contract, String duration, String barSize, String whatToShow) {
+        int reqId = nextReqId();
+        HistoricalDataAccumulator acc = new HistoricalDataAccumulator();
+        historicalDataMap.put(reqId, acc);
+
+        log.info("reqHistoricalData reqId={} duration={} barSize={} whatToShow={}", reqId, duration, barSize, whatToShow);
+        // useRTH=1 (regular trading hours), formatDate=1
+        client.reqHistoricalData(reqId, contract, "", duration, barSize, whatToShow, 1, 1, false, Collections.emptyList());
+
+        return acc.future
+                .orTimeout(30, TimeUnit.SECONDS)
+                .<List<HistoricalBar>>thenApply(a -> new ArrayList<>(a.bars))
+                .whenComplete((r, ex) -> {
+                    if (ex != null)
+                        log.warn("reqHistoricalData failed reqId={}: {}", reqId, ex.getMessage());
+                    historicalDataMap.remove(reqId);
                 });
     }
 
@@ -328,6 +354,22 @@ public class IbkrDispatcher extends DefaultEWrapper {
         log.warn("IBKR connection closed");
     }
 
+    // ── Historical data callbacks ──────────────────────────────
+
+    @Override
+    public void historicalData(int reqId, Bar bar) {
+        HistoricalDataAccumulator acc = historicalDataMap.get(reqId);
+        if (acc != null)
+            acc.bars.add(new HistoricalBar(bar.time(), bar.open(), bar.high(), bar.low(), bar.close()));
+    }
+
+    @Override
+    public void historicalDataEnd(int reqId, String startDateStr, String endDateStr) {
+        HistoricalDataAccumulator acc = historicalDataMap.remove(reqId);
+        if (acc != null)
+            acc.future.complete(acc);
+    }
+
     private TickData mapToTickData(TickAccumulator a) {
         return new TickData(
                 a.bid, a.ask, a.last, a.close, a.optPrice, a.undPrice,
@@ -360,5 +402,10 @@ public class IbkrDispatcher extends DefaultEWrapper {
         volatile int bidSize, askSize, volume, openInterest;
         volatile boolean greeksReceived;
         final CompletableFuture<TickAccumulator> future = new CompletableFuture<>();
+    }
+
+    static class HistoricalDataAccumulator {
+        final List<HistoricalBar> bars = Collections.synchronizedList(new ArrayList<>());
+        final CompletableFuture<HistoricalDataAccumulator> future = new CompletableFuture<>();
     }
 }
