@@ -126,6 +126,11 @@ public class IbkrClientService {
         return dispatcher.reqMktData(contract, timeoutMs);
     }
 
+    public CompletableFuture<TickData> reqUnderlyingPrice(Contract contract, int timeoutMs) {
+        if (!isConnected()) return CompletableFuture.completedFuture(TickData.EMPTY);
+        return dispatcher.reqUnderlyingPrice(contract, timeoutMs);
+    }
+
     public CompletableFuture<List<HistoricalBar>> reqHistoricalData(
             Contract contract, String duration, String barSize, String whatToShow) {
         if (!isConnected()) return CompletableFuture.completedFuture(List.of());

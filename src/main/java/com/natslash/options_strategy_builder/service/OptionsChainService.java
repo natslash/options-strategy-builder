@@ -27,12 +27,14 @@ public class OptionsChainService {
     private static final int    WINDOW_MS              = 1500;
     private static final int    MAX_DTE_DAYS           = 180;
     private static final long   PARAMS_CACHE_TTL_MS    = 60 * 60 * 1000L; // 1 hour
-    static final int            DEFAULT_STRIKE_COUNT   = 25;
+    private static final int    DEFAULT_STRIKE_RANGE   = 10; // ±10% of spot when instrument.strikeRange is null
     private static final DateTimeFormatter FMT         = DateTimeFormatter.ofPattern("yyyyMMdd");
 
     // IBKR market data types
-    private static final int MDT_LIVE   = 1;
-    private static final int MDT_FROZEN = 2;
+    private static final int MDT_LIVE           = 1;
+    // MDT=4: works for real-time AND delayed-only subscribers. IBKR auto-uses live/frozen data when a
+    // real-time subscription exists; otherwise returns delayed-frozen data with Greeks in fields 80/81/83.
+    private static final int MDT_DELAYED_FROZEN = 4;
 
     private final IbkrClientService         ibkr;
     private final RateLimitedRequestManager rateLimiter;
@@ -56,30 +58,25 @@ public class OptionsChainService {
 
     public ChainFilterParams fetchChainParams(Instrument instrument) throws Exception {
         boolean marketHours = schedule.isMarketHours();
-        ibkr.reqMarketDataType(marketHours ? MDT_LIVE : MDT_FROZEN);
+        ibkr.reqMarketDataType(marketHours ? MDT_LIVE : MDT_DELAYED_FROZEN);
 
-        // Fire spot request concurrently with params fetch.
-        // Use conId-based contract (not secType=IND) so this works for both index and
-        // futures-based underlyings (e.g. DAX index vs ESTX50 futures).
-        // snapshot=true: frozen close is immediately available; no need to stream for 1s.
-        CompletableFuture<TickData> spotFut = ibkr.reqMktData(buildUnderlyingContract(instrument), WINDOW_MS);
+        // Params first, then spot. Firing both concurrently caused the spot tick to arrive
+        // after the 1500ms timeout on a cold cache — reqSecDefOptParams (up to 30s) competes
+        // for the same IBKR connection and delays tickPrice callbacks.
         ChainParams params = getCachedParams(instrument);
-
-        TickData spotTick = spotFut.join();
+        // Off-hours: delayed-frozen data can take longer to arrive than real-time ticks.
+        int spotTimeout = marketHours ? WINDOW_MS : WINDOW_MS + 3500;
+        TickData spotTick = ibkr.reqUnderlyingPrice(buildUnderlyingContract(instrument), spotTimeout).join();
         List<Double> sortedStrikes = params.strikes().stream().sorted().toList();
         double spot = extractSpot(spotTick, instrument.getSymbol())
-                .orElseGet(() -> {
-                    if (sortedStrikes.isEmpty()) return 0.0;
-                    double median = sortedStrikes.get(sortedStrikes.size() / 2);
-                    log.warn("{}: no underlying price from IBKR — using median strike {} for display",
-                            instrument.getSymbol(), median);
-                    return median;
-                });
+                .orElseThrow(() -> new RuntimeException(
+                        instrument.getSymbol() + ": no spot price from IBKR — check IBGW connection and market data subscription"));
 
         List<String> expiries = params.expirations().stream().sorted().toList();
         DoubleSummaryStatistics stats = params.strikes().stream()
                 .mapToDouble(Double::doubleValue).summaryStatistics();
-        List<Double> windowStrikes = strikeWindow(sortedStrikes, spot, DEFAULT_STRIKE_COUNT);
+        int range = instrument.getStrikeRange() != null ? instrument.getStrikeRange() : DEFAULT_STRIKE_RANGE;
+        List<Double> windowStrikes = strikeByRange(sortedStrikes, spot, range);
         log.info("ChainParams for {}: {} expiries, strikes {}-{}, spot={}, window={}",
                 instrument.getSymbol(), expiries.size(), stats.getMin(), stats.getMax(), spot, windowStrikes.size());
         return new ChainFilterParams(spot, expiries, stats.getMin(), stats.getMax(),
@@ -126,14 +123,16 @@ public class OptionsChainService {
     public List<OptionContract> fetchChain(Instrument instrument, Double providedSpot,
                                             boolean forceRefresh, String expiry,
                                             boolean includeMonthly, boolean includeWeekly,
-                                            String strikeFilter, int strikeCount)
+                                            String strikeFilter)
             throws Exception {
 
-        // 1. Set market data type — frozen outside hours so we get last known prices
+        // 1. Set market data type
+        // MDT=4 (DELAYED_FROZEN) off-hours: works for both real-time and delayed-only subscribers.
+        // IBKR delivers Greeks as fields 80/81/83 (delayed) or 10/11/13 (live, if subscription exists).
         boolean marketHours = schedule.isMarketHours();
         if (!marketHours) {
-            ibkr.reqMarketDataType(MDT_FROZEN);
-            log.info("Outside market hours — using frozen data");
+            ibkr.reqMarketDataType(MDT_DELAYED_FROZEN);
+            log.info("Outside market hours — using delayed-frozen data (MDT=4)");
         } else {
             ibkr.reqMarketDataType(MDT_LIVE);
         }
@@ -145,46 +144,43 @@ public class OptionsChainService {
         double spot = resolveSpot(instrument, params, providedSpot);
 
         // 4. Fetch from IBKR with configured filters
-        // Frozen mode needs extra time for the model calculation to arrive
-        int tickTimeout = marketHours ? WINDOW_MS : WINDOW_MS + 500;
+        // Off-hours: longer window gives delayed Greeks (field 83) time to arrive before timeout.
+        int tickTimeout = marketHours ? WINDOW_MS : WINDOW_MS + 3500;
         List<OptionContract> contracts = fetchFromIbkr(
-                instrument, params, spot, expiry, includeMonthly, includeWeekly, strikeFilter, strikeCount, tickTimeout, marketHours);
+                instrument, params, spot, expiry, includeMonthly, includeWeekly, strikeFilter, tickTimeout, marketHours);
 
-        // 5. Reset to live data
+        // 5. Reset to live so unrelated reqMktData calls (e.g. spot fetch) get live data
         ibkr.reqMarketDataType(MDT_LIVE);
 
         return contracts;
     }
 
     /**
-     * Spot resolution — three levels, never fails if strikes exist:
-     * 1. providedSpot from frontend (came from a recent fetchChainParams call) — fastest, use it
-     * 2. IBKR underlying market data via conId — works for both IND and FUT instruments
-     * 3. Median of available strikes — always present; OTM% will be approximate but chain is shown
+     * Spot resolution — IBKR is always the primary source:
+     * 1. IBKR underlying market data via conId — live price during market hours,
+     *    frozen/delayed close off-hours. MDT is already set by the caller.
+     * 2. providedSpot — used as fallback only when IBKR returns no price
+     *    (e.g. disconnected, subscription gap). Never used as a shortcut that
+     *    skips the IBKR fetch, because providedSpot may be stale.
      */
     double resolveSpot(Instrument instrument, ChainParams params, Double providedSpot) {
-        if (providedSpot != null && providedSpot > 0) {
-            log.info("Using provided spot for {}: {}", instrument.getSymbol(), providedSpot);
-            return providedSpot;
-        }
-
         try {
-            TickData tick = ibkr.reqMktData(buildUnderlyingContract(instrument), WINDOW_MS).join();
+            // Off-hours: allow extra time for delayed-frozen data (matches option tick window).
+            int spotTimeout = schedule.isMarketHours() ? WINDOW_MS : WINDOW_MS + 3500;
+            TickData tick = ibkr.reqUnderlyingPrice(buildUnderlyingContract(instrument), spotTimeout).join();
             Optional<Double> ibkrSpot = extractSpot(tick, instrument.getSymbol());
             if (ibkrSpot.isPresent()) return ibkrSpot.get();
         } catch (Exception e) {
             log.warn("Underlying market data unavailable for {}: {}", instrument.getSymbol(), e.getMessage());
         }
 
-        List<Double> sorted = params.strikes().stream().sorted().toList();
-        if (!sorted.isEmpty()) {
-            double median = sorted.get(sorted.size() / 2);
-            log.warn("{}: no live spot — using median strike {} as proxy (OTM% approximate)",
-                    instrument.getSymbol(), median);
-            return median;
+        if (providedSpot != null && providedSpot > 0) {
+            log.warn("{}: no IBKR spot — falling back to provided spot: {}", instrument.getSymbol(), providedSpot);
+            return providedSpot;
         }
 
-        throw new RuntimeException("No strikes available for " + instrument.getSymbol());
+        throw new RuntimeException("No spot price available for " + instrument.getSymbol()
+                + " — ensure IBGW is connected and instrument has market data");
     }
 
     /** Extracts last or close price from a tick. Returns empty if no usable price is available. */
@@ -200,12 +196,17 @@ public class OptionsChainService {
 
     /**
      * Builds a contract that uniquely identifies the underlying by conId.
-     * This works for both index (IND) and futures-based (FUT) underlyings — e.g. DAX index
-     * and ESTX50 futures — without hardcoding secType="IND" which would fail for FUT instruments.
+     * Prefers futuresConId (e.g. FESX for ESTX50) when set — futures contracts have broader
+     * market data subscriptions and return live spot prices more reliably than index cash contracts.
+     * Falls back to conId for instruments without a linked futures contract (pure equities/ETFs).
      */
     private Contract buildUnderlyingContract(Instrument instrument) {
         Contract c = new Contract();
-        c.conid(instrument.getConId());
+        boolean hasFutures = instrument.getFuturesConId() != null;
+        Integer cid = hasFutures ? instrument.getFuturesConId() : instrument.getConId();
+        log.debug("buildUnderlyingContract for {}: conId={} ({})",
+                instrument.getSymbol(), cid, hasFutures ? "futuresConId" : "instrument conId");
+        c.conid(cid);
         c.exchange(instrument.getExchange());
         return c;
     }
@@ -221,7 +222,6 @@ public class OptionsChainService {
                                                 boolean includeMonthly,
                                                 boolean includeWeekly,
                                                 String strikeFilter,
-                                                int strikeCount,
                                                 int tickTimeoutMs,
                                                 boolean marketHours) {
         long fetchStart = System.currentTimeMillis();
@@ -239,18 +239,19 @@ public class OptionsChainService {
         }
         log.info("Expiries ({}): {}", expiries.size(), expiries);
 
-        // Filter strikes: ACTIVE = index-based ±N/2 window centred on ATM; ALL = every theoretical strike
+        // Filter strikes: ACTIVE = real gap around ATM within instrument.strikeRange%; ALL = every strike
         List<Double> allAvailableStrikes = params.strikes().stream().sorted().toList();
         log.info("IBKR strikes available: {} total, range {}-{}",
                 allAvailableStrikes.size(),
                 allAvailableStrikes.isEmpty() ? "n/a" : allAvailableStrikes.get(0),
                 allAvailableStrikes.isEmpty() ? "n/a" : allAvailableStrikes.get(allAvailableStrikes.size() - 1));
 
+        int range = instrument.getStrikeRange() != null ? instrument.getStrikeRange() : DEFAULT_STRIKE_RANGE;
         List<Double> strikes = "ALL".equals(strikeFilter)
                 ? allAvailableStrikes
-                : strikeWindow(allAvailableStrikes, spot, strikeCount);
-        log.info("Spot={} strikeFilter={} count={} → {} strikes (min={} max={})",
-                spot, strikeFilter, strikeCount, strikes.size(),
+                : strikeByRange(allAvailableStrikes, spot, range);
+        log.info("Spot={} strikeFilter={} range=±{}% → {} strikes (min={} max={})",
+                spot, strikeFilter, range, strikes.size(),
                 strikes.isEmpty() ? "n/a" : strikes.get(0),
                 strikes.isEmpty() ? "n/a" : strikes.get(strikes.size() - 1));
 
@@ -288,8 +289,9 @@ public class OptionsChainService {
                                                 tick.bid(), tick.ask(), tick.last(), tick.close(),
                                                 tick.impliedVol(), tick.delta(), tick.greeksReceived());
                                     }
-                                    // Always include the contract — empty data shows as dashes in the UI.
-                                    // The frontend 'Quoted' display filter handles visibility.
+                                    // Skip contracts with no market data — 5-point strikes deep
+                                    // in the chain often have no quotes or Greeks off-hours.
+                                    if (!tick.hasData()) return Optional.<OptionContract>empty();
                                     return Optional.of(toOptionContract(req, tick, spot, multiplier, marketHours));
                                 })
                                 .exceptionally(ex -> {
@@ -404,26 +406,23 @@ public class OptionsChainService {
     private record ContractRequest(String expiry, double strike, String type) {}
 
     // ═══════════════════════════════════════════════════════════
-    // Strike window helper
+    // Strike range helper
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * Returns a sub-list of {@code count} strikes centred on the ATM strike (binary search).
+     * Returns strikes within ±rangePercent% of spot using the instrument's actual IBKR strike grid.
+     * The gap between strikes is real (e.g. 25 pts for ESTX50, 5 pts for SPX) — the count
+     * emerges from the grid, not a forced window.
      * Package-private for unit testing.
      *
-     * @param sorted ascending-sorted strike list from IBKR
-     * @param spot   current underlying price
-     * @param count  total desired window size, centred on ATM (count/2 below + count/2 above, clamped to list bounds)
+     * @param sorted      ascending-sorted strike list from IBKR
+     * @param spot        current underlying price
+     * @param rangePercent percentage of spot for the half-range (e.g. 10 → spot±10%)
      */
-    static List<Double> strikeWindow(List<Double> sorted, double spot, int count) {
-        if (sorted.isEmpty() || count <= 0) return Collections.emptyList();
-        int idx = Collections.binarySearch(sorted, spot);
-        if (idx < 0) idx = ~idx;                   // insertion point when not found
-        idx = Math.min(idx, sorted.size() - 1);    // clamp to last element
-        int half = count / 2;
-        int from = Math.max(0, idx - half);
-        int to   = Math.min(sorted.size(), from + count);
-        from     = Math.max(0, to - count);         // re-anchor from when we hit the end
-        return List.copyOf(sorted.subList(from, to));
+    static List<Double> strikeByRange(List<Double> sorted, double spot, int rangePercent) {
+        if (sorted.isEmpty() || rangePercent <= 0 || spot <= 0) return Collections.emptyList();
+        double lo = spot * (1.0 - rangePercent / 100.0);
+        double hi = spot * (1.0 + rangePercent / 100.0);
+        return sorted.stream().filter(s -> s >= lo && s <= hi).toList();
     }
 }

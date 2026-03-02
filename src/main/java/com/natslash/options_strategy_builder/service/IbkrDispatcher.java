@@ -122,30 +122,39 @@ public class IbkrDispatcher extends DefaultEWrapper {
     }
 
     /**
-     * Requests market data for a specific contract and gathers results over a time
-     * window.
-     * * @param contract The option or index contract to fetch
-     * 
-     * @param timeoutMs The window (e.g., 1000-1500ms) to wait for the data burst to
-     *                  complete
-     * @return A future containing the aggregated TickData
+     * Requests market data for an option contract.
+     *
+     * <p>Streaming mode (snapshot=false) with generic ticks "100,101,106". Tick 106 (Option IV)
+     * triggers IBKR's server-side Black-Scholes model, emitting Greeks as field 13 (MODEL_OPTION)
+     * during live hours or field 83 (DELAYED_MODEL_OPTION) with MDT=4. The {@code completeOnTimeout}
+     * window collects the full data burst. {@code tickSnapshotEnd} is intentionally ignored — it
+     * fires as an IBKR quirk before Greeks arrive in streaming mode.
+     *
+     * <p>NOTE: snapshot=true is intentionally not supported here. IBKR error 321 rejects any
+     * combination of snapshot=true + non-empty genericTickList. Streaming mode handles both live
+     * and delayed (MDT=4) Greeks reliably within the timeout window.
      */
     public CompletableFuture<TickData> reqMktData(Contract contract, int timeoutMs) {
+        return reqMktDataInternal(contract, timeoutMs, "100,101,106");
+    }
+
+    /**
+     * Requests market data for an underlying (index/futures) contract — spot price only.
+     *
+     * <p>Uses empty genericTickList (underlying contracts are not options; option-specific
+     * generic ticks 100/101/106 are unnecessary). Price arrives via {@code tickPrice} callbacks:
+     * field 4 (last) or field 9 (close). Works in both live (MDT=1) and delayed-frozen (MDT=4) modes.
+     */
+    public CompletableFuture<TickData> reqUnderlyingPrice(Contract contract, int timeoutMs) {
+        return reqMktDataInternal(contract, timeoutMs, "");
+    }
+
+    private CompletableFuture<TickData> reqMktDataInternal(Contract contract, int timeoutMs, String genericTicks) {
         int reqId = reqIdCounter.getAndIncrement();
         TickAccumulator acc = new TickAccumulator();
         tickMap.put(reqId, acc);
 
-        // Generic tick "106" (Option Implied Volatility) tells IBKR to run its
-        // Black-Scholes model for the contract even when the market is closed.
-        // This is what causes tick type 13 (MODEL_OPTION Greeks) to arrive for
-        // contracts that have no live bid/ask — the key for off-hours Greek data.
-        // "100" = Historical Volatility (helps model seed), "101" = Open Interest.
-        // snapshot=false: keep subscription open until cancelMktData so the full
-        // model burst (Greeks + IV) has time to arrive before the timeout fires.
-        client.reqMktData(reqId, contract, "100,101,106", false, false, Collections.emptyList());
-
-        // Wait the full timeout window so Bid/Ask and Model Greeks all arrive before mapping.
-        // tickSnapshotEnd or error callbacks may complete the future earlier if applicable.
+        client.reqMktData(reqId, contract, genericTicks, false, false, Collections.emptyList());
         acc.future.completeOnTimeout(acc, timeoutMs, TimeUnit.MILLISECONDS);
 
         return acc.future
@@ -225,10 +234,10 @@ public class IbkrDispatcher extends DefaultEWrapper {
         if (acc == null || price <= 0)
             return;
         switch (field) {
-            case 1 -> acc.bid = price;
-            case 2 -> acc.ask = price;
-            case 4 -> acc.last = price;
-            case 9 -> acc.close = price;
+            case 1,  68 -> acc.bid   = price;  // BID / DELAYED_BID
+            case 2,  69 -> acc.ask   = price;  // ASK / DELAYED_ASK
+            case 4,  70 -> acc.last  = price;  // LAST / DELAYED_LAST
+            case 9,  75 -> acc.close = price;  // CLOSE / DELAYED_CLOSE
         }
     }
 
@@ -238,10 +247,10 @@ public class IbkrDispatcher extends DefaultEWrapper {
         if (acc == null)
             return;
         switch (field) {
-            case 0 -> acc.bidSize = (int) size.longValue();
-            case 3 -> acc.askSize = (int) size.longValue();
-            case 8 -> acc.volume = (int) size.longValue();
-            case 22 -> acc.openInterest = (int) size.longValue();
+            case 0,  66 -> acc.bidSize      = (int) size.longValue();  // BID_SIZE / DELAYED_BID_SIZE
+            case 3,  67 -> acc.askSize      = (int) size.longValue();  // ASK_SIZE / DELAYED_ASK_SIZE
+            case 8,  74 -> acc.volume       = (int) size.longValue();  // VOLUME / DELAYED_VOLUME
+            case 22      -> acc.openInterest = (int) size.longValue();  // OPTION_OPEN_INTEREST
         }
     }
 
@@ -257,24 +266,29 @@ public class IbkrDispatcher extends DefaultEWrapper {
         if (acc == null)
             return;
 
-        // Field 13 = Model calculation (Server-side Black-Scholes)
-        // Field 10/11 = Bid/Ask based Greeks (Only available during market hours)
-        if (field == 13 || field == 10 || field == 11) {
-            // IBKR returns -1 or -2 for values that aren't yet calculated; we filter those
-            // out.
-            if (impliedVol > 0)
+        // Real-time (MDT 1/2): 10=BID_OPTION, 11=ASK_OPTION, 13=MODEL_OPTION
+        // Delayed  (MDT 3/4): 80=DELAYED_BID, 81=DELAYED_ASK, 83=DELAYED_MODEL_OPTION
+        // Field 83 is the primary carrier of off-hours Greeks when no real-time subscription exists.
+        if (field == 13 || field == 83 ||
+                field == 10 || field == 80 ||
+                field == 11 || field == 81) {
+            // IBKR returns -1/-2 for uncalculated values and Double.MAX_VALUE as a sentinel
+            // for "not available" (e.g. vega/theta/gamma when the model hasn't converged).
+            // Double.POSITIVE_INFINITY can appear for IV on deep-ITM/OTM options.
+            // We guard both: reject non-positive sentinels AND non-finite values.
+            if (impliedVol > 0 && Double.isFinite(impliedVol))
                 acc.impliedVol = impliedVol;
-            if (delta >= -1 && delta <= 1)
+            if (delta >= -1 && delta <= 1)    // bounds already exclude MAX_VALUE / Infinity
                 acc.delta = delta;
-            if (gamma > -2)
+            if (gamma > -2 && Double.isFinite(gamma))
                 acc.gamma = gamma;
-            if (vega > -2)
+            if (vega  > -2 && Double.isFinite(vega))
                 acc.vega = vega;
-            if (theta > -2)
+            if (theta > -2 && Double.isFinite(theta))
                 acc.theta = theta;
-            if (optPrice > 0)
+            if (optPrice > 0 && Double.isFinite(optPrice))
                 acc.optPrice = optPrice;
-            if (undPrice > 0)
+            if (undPrice > 0 && Double.isFinite(undPrice))
                 acc.undPrice = undPrice;
 
             // Mark that we have at least one successful Greek data point
@@ -287,9 +301,9 @@ public class IbkrDispatcher extends DefaultEWrapper {
 
     @Override
     public void tickSnapshotEnd(int reqId) {
-        TickAccumulator acc = tickMap.remove(reqId);
-        if (acc != null)
-            acc.future.complete(acc);
+        // All requests use streaming mode (snapshot=false). tickSnapshotEnd is a known IBKR
+        // quirk that can fire before tickOptionComputation in streaming mode.
+        // Ignore it — completeOnTimeout owns completion.
     }
 
     @Override
@@ -310,9 +324,8 @@ public class IbkrDispatcher extends DefaultEWrapper {
         log.debug(">>> SUBSCRIPTION CHECK: ReqId {} is receiving {} data", reqId, typeStr);
 
         if (marketDataType >= 3) {
-            log.error("PERMISSIONS ALERT: ReqId {} is being downgraded to DELAYED. " +
-                    "This confirms IBKR does not recognize your real-time subscription " +
-                    "for this specific exchange/instrument.", reqId);
+            log.info("ReqId {} using {} data — no real-time subscription for this instrument; " +
+                    "delayed Greeks will arrive as fields 80/81/83 instead of 10/11/13.", reqId, typeStr);
         }
     }
 

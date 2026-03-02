@@ -47,29 +47,25 @@ class OptionsChainServiceTest {
     // ── resolveSpot priority ───────────────────────────────────────────────
 
     /**
-     * Reveals the production bug: IBKR index returns stale close (last=null, close=4360)
-     * while the frontend already sent the correct live spot (6124.85).
-     * After the fix, providedSpot must take priority over any IBKR value.
+     * IBKR is always the primary source. Even when providedSpot is supplied (from a prior
+     * fetchChainParams call), the live IBKR price must win — providedSpot may be stale.
      */
     @Test
-    void resolveSpot_returnsProvidedSpot_notStaleIbkrClose() throws Exception {
-        // lenient: providedSpot > 0 short-circuits before any IBKR call
-        lenient().when(ibkr.reqMktData(any(), anyInt()))
-                .thenReturn(CompletableFuture.completedFuture(tickWith(null, 4360.0)));
+    void resolveSpot_alwaysUsesIbkrSpot_ignoresProvidedSpot() throws Exception {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
+                .thenReturn(CompletableFuture.completedFuture(tickWith(6200.0, null)));
 
-        double result = service.resolveSpot(instrument, params, 6124.85);
+        double result = service.resolveSpot(instrument, params, 6124.85); // providedSpot ignored
 
-        assertThat(result).isEqualTo(6124.85);
+        assertThat(result).isEqualTo(6200.0); // IBKR live price wins
     }
 
     /**
-     * When no spot is provided, live IBKR underlying price is fetched and used.
-     * The underlying contract uses the 2-param reqMktData (snapshot=true).
+     * No providedSpot — IBKR last price is fetched and returned directly.
      */
     @Test
-    void resolveSpot_fetchesLiveIbkrSpot_whenNoProvidedSpot() throws Exception {
-        // 2-param: underlying contract (snapshot=true, fast frozen close)
-        when(ibkr.reqMktData(any(), anyInt()))
+    void resolveSpot_fetchesIbkrSpot_whenNoProvidedSpot() throws Exception {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(tickWith(6124.85, null)));
 
         double result = service.resolveSpot(instrument, params, null);
@@ -78,71 +74,79 @@ class OptionsChainServiceTest {
     }
 
     /**
-     * When IBKR has no price (off-hours, no subscription), falls back to median strike.
-     * params has 5 strikes: [5000, 5500, 6000, 6500, 7000] → median = index 2 = 6000.
-     * Chain fetch never fails due to missing spot data.
+     * IBKR returns no price (disconnected / no subscription) — providedSpot is accepted
+     * as a fallback so the chain fetch can still proceed with the last known value.
      */
     @Test
-    void resolveSpot_usesMedianStrike_whenIbkrUnavailable() {
-        when(ibkr.reqMktData(any(), anyInt()))
+    void resolveSpot_usesProvidedSpot_whenIbkrReturnsNoPrice() {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(emptyTick()));
 
-        double result = service.resolveSpot(instrument, params, null);
+        double result = service.resolveSpot(instrument, params, 6000.0);
 
-        assertThat(result).isEqualTo(6000.0); // median of [5000,5500,6000,6500,7000]
+        assertThat(result).isEqualTo(6000.0);
     }
 
     /**
-     * RuntimeException is only thrown when strikes are empty — means there's genuinely
-     * nothing to show (no chain data at all), not just missing market data.
+     * IBKR unavailable AND no providedSpot — must throw, not fall back to median strike.
+     * Median-strike fallback produced inaccurate OTM% and silently misled the user.
      */
     @Test
-    void resolveSpot_throws_whenNoStrikesAvailable() {
-        when(ibkr.reqMktData(any(), anyInt()))
+    void resolveSpot_throws_whenIbkrUnavailableAndNoProvidedSpot() {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(emptyTick()));
-        ChainParams emptyParams = new ChainParams(List.of("20260320"), List.of());
 
-        assertThatThrownBy(() -> service.resolveSpot(instrument, emptyParams, null))
+        assertThatThrownBy(() -> service.resolveSpot(instrument, params, null))
                 .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("No strikes available");
+                .hasMessageContaining("No spot price available");
     }
 
-    // ── strikeWindow ──────────────────────────────────────────────────────
+    // ── strikeByRange ──────────────────────────────────────────────────────
 
+    /**
+     * Spot=5000, ±10% → lo=4500, hi=5500. Strikes at 4500/5000/5500 are included (inclusive bounds).
+     * Strikes at 4000 and 6000 are outside the range.
+     */
     @Test
-    void strikeWindow_spotInMiddle_returnsExactCount() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
-        // spot=4.0 at idx=3, count=4 → half=2, from=max(0,3-2)=1, to=min(7,1+4)=5, from=max(0,5-4)=1
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 4.0, 4);
-        assertThat(result).hasSize(4).containsExactly(2.0, 3.0, 4.0, 5.0);
+    void strikeByRange_returnsStrikesWithinPercentRange() {
+        List<Double> strikes = List.of(4000.0, 4500.0, 5000.0, 5500.0, 6000.0);
+        List<Double> result = OptionsChainService.strikeByRange(strikes, 5000.0, 10);
+        assertThat(result).containsExactly(4500.0, 5000.0, 5500.0);
     }
 
+    /**
+     * The count emerges from the actual strike gap — no forced window size.
+     * ESTX50-like: spot=5000, gap=25pts, ±10% → ~(1000/25)=40 strikes.
+     */
     @Test
-    void strikeWindow_spotAtMinimum_windowStartsAtIndex0() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0);
-        // spot below list → insertion point 0
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 0.5, 3);
-        assertThat(result).hasSize(3).containsExactly(1.0, 2.0, 3.0);
-    }
-
-    @Test
-    void strikeWindow_spotAtMaximum_windowEndsAtLastIndex() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0);
-        // spot above list → insertion point = size → clamped to size-1
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 6.0, 3);
-        assertThat(result).hasSize(3).containsExactly(3.0, 4.0, 5.0);
-    }
-
-    @Test
-    void strikeWindow_countExceedsListSize_returnsWholeList() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0);
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 2.0, 10);
-        assertThat(result).hasSize(3).containsExactly(1.0, 2.0, 3.0);
+    void strikeByRange_countReflectsRealGap() {
+        // Simulate 25-point ESTX50 grid from 4000 to 6000
+        List<Double> strikes = new java.util.ArrayList<>();
+        for (double s = 4000.0; s <= 6000.0; s += 25.0) strikes.add(s);
+        List<Double> result = OptionsChainService.strikeByRange(strikes, 5000.0, 10);
+        // ±10% of 5000 = 4500–5500, 25-point gap → 41 strikes
+        assertThat(result.get(0)).isGreaterThanOrEqualTo(4500.0);
+        assertThat(result.get(result.size() - 1)).isLessThanOrEqualTo(5500.0);
+        assertThat(result.size()).isGreaterThan(30); // real gap produces real count, not a fixed 25
     }
 
     @Test
-    void strikeWindow_emptyList_returnsEmpty() {
-        List<Double> result = OptionsChainService.strikeWindow(List.of(), 5000.0, 25);
+    void strikeByRange_spotBelowAllStrikes_returnsEmpty() {
+        List<Double> strikes = List.of(5000.0, 5100.0, 5200.0);
+        // spot=100 ±10% → lo=90, hi=110 — no strikes in that range
+        List<Double> result = OptionsChainService.strikeByRange(strikes, 100.0, 10);
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void strikeByRange_emptyList_returnsEmpty() {
+        List<Double> result = OptionsChainService.strikeByRange(List.of(), 5000.0, 10);
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void strikeByRange_zeroRange_returnsEmpty() {
+        List<Double> result = OptionsChainService.strikeByRange(List.of(5000.0), 5000.0, 0);
         assertThat(result).isEmpty();
     }
 

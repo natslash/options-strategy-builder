@@ -177,8 +177,7 @@ public class ChainController {
             @RequestParam(required = false) String expiry,
             @RequestParam(defaultValue = "true")   boolean includeMonthly,
             @RequestParam(defaultValue = "false")  boolean includeWeekly,
-            @RequestParam(defaultValue = "ACTIVE") String  strikeFilter,
-            @RequestParam(defaultValue = "25")     int     strikeCount) throws Exception { // must match OptionsChainService.DEFAULT_STRIKE_COUNT
+            @RequestParam(defaultValue = "ACTIVE") String  strikeFilter) throws Exception {
 
         Instrument instrument = instrumentRepository.findById(instrumentId)
                 .orElseThrow(() -> new IllegalArgumentException("Instrument not found: " + instrumentId));
@@ -190,13 +189,13 @@ public class ChainController {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
         }
 
-        log.info("Chain request: instrumentId={} expiry={} spot={} strikeFilter={} strikeCount={} includeMonthly={} includeWeekly={}",
-                instrumentId, expiry, spot, strikeFilter, strikeCount, includeMonthly, includeWeekly);
+        log.info("Chain request: instrumentId={} expiry={} spot={} strikeFilter={} includeMonthly={} includeWeekly={}",
+                instrumentId, expiry, spot, strikeFilter, includeMonthly, includeWeekly);
 
         try {
             return ResponseEntity.ok(chainService.fetchChain(
                     instrument, spot, forceRefresh, expiry,
-                    includeMonthly, includeWeekly, strikeFilter, strikeCount));
+                    includeMonthly, includeWeekly, strikeFilter));
         } catch (Exception e) {
             log.error("Chain fetch failed for {}: {}", instrument.getSymbol(), e.getMessage(), e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
