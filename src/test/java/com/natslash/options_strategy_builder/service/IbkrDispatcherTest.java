@@ -175,4 +175,43 @@ class IbkrDispatcherTest {
         assertThat(result.greeksReceived()).isTrue();
         assertThat(result.delta()).isEqualTo(0.45);
     }
+
+    // ── Early completion ─────────────────────────────────────────
+
+    /**
+     * reqUnderlyingPrice sets expectGreeks=false. tryCompleteEarly fires as soon as
+     * a last/close price arrives — the future must complete before the 5-second timeout.
+     */
+    @Test
+    void reqUnderlyingPrice_completes_early_on_price_arrival() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqUnderlyingPrice(mockContract, 5000);
+
+        dispatcher.tickPrice(reqId, 4, 6200.0, null); // field 4 = LAST
+
+        assertThat(future).isDone();
+        assertThat(future.join().last()).isEqualTo(6200.0);
+    }
+
+    /**
+     * reqMktData sets expectGreeks=true. tryCompleteEarly requires BOTH greeksReceived AND
+     * at least one price field. The future must stay pending after Greeks alone, then complete
+     * immediately once a price tick also arrives — without waiting for the 5-second timeout.
+     */
+    @Test
+    void reqMktData_completes_early_when_price_and_greeks_received() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 5000);
+
+        // Greeks arrive first — price still missing, must not complete yet
+        dispatcher.tickOptionComputation(reqId, 13, 0,
+                0.20, 0.45, 2.50, 0, 0.02, 0.01, -0.05, 5000.0);
+        assertThat(future).isNotDone();
+
+        // Price arrives — both conditions met → early completion
+        dispatcher.tickPrice(reqId, 4, 2.48, null); // field 4 = LAST
+
+        assertThat(future).isDone();
+        assertThat(future.join().delta()).isEqualTo(0.45);
+    }
 }

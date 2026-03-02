@@ -150,6 +150,55 @@ class OptionsChainServiceTest {
         assertThat(result).isEmpty();
     }
 
+    // ── centredSublist ─────────────────────────────────────────────────────
+
+    /**
+     * Standard case: ATM at index 4 (5000.0), cap=4.
+     * half=2, start=max(0,4-2)=2, end=min(10,2+4)=6 → [4800, 4900, 5000, 5100].
+     */
+    @Test
+    void centredSublist_returnsStrikesCentredAroundAtm() {
+        List<Double> strikes = List.of(4600.0, 4700.0, 4800.0, 4900.0, 5000.0,
+                                       5100.0, 5200.0, 5300.0, 5400.0, 5500.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5000.0, 4);
+        assertThat(result).containsExactly(4800.0, 4900.0, 5000.0, 5100.0);
+    }
+
+    /**
+     * ATM near the start: window clamps at index 0 and shifts right.
+     * strikes=[5000,5100,5200,5300,5400], ATM=index 0, cap=4
+     * start=max(0,0-2)=0, end=min(5,0+4)=4 → [5000, 5100, 5200, 5300].
+     */
+    @Test
+    void centredSublist_atmNearStart_doesNotGoNegative() {
+        List<Double> strikes = List.of(5000.0, 5100.0, 5200.0, 5300.0, 5400.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5000.0, 4);
+        assertThat(result).hasSize(4);
+        assertThat(result.get(0)).isEqualTo(5000.0);
+    }
+
+    /**
+     * ATM near the end: window clamps at the last index and shifts left.
+     * strikes=[4700,4800,4900,5000,5100], ATM=index 4 (5100), cap=4
+     * start=max(0,4-2)=2, end=min(5,2+4)=5, start=max(0,5-4)=1 → [4800,4900,5000,5100].
+     */
+    @Test
+    void centredSublist_atmNearEnd_shiftsWindowLeft() {
+        List<Double> strikes = List.of(4700.0, 4800.0, 4900.0, 5000.0, 5100.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5100.0, 4);
+        assertThat(result).containsExactly(4800.0, 4900.0, 5000.0, 5100.0);
+    }
+
+    /**
+     * Total strikes fewer than cap — all are returned unchanged.
+     */
+    @Test
+    void centredSublist_fewerStrikesThanCap_returnsAll() {
+        List<Double> strikes = List.of(4900.0, 5000.0, 5100.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5000.0, 10);
+        assertThat(result).containsExactly(4900.0, 5000.0, 5100.0);
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     private TickData tickWith(Double last, Double close) {
