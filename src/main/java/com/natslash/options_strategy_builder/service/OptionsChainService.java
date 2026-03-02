@@ -17,7 +17,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
-import java.util.DoubleSummaryStatistics;
 
 @Slf4j
 @Service
@@ -50,10 +49,6 @@ public class OptionsChainService {
 
     // ═══════════════════════════════════════════════════════════
     // Public API
-    // ═══════════════════════════════════════════════════════════
-
-    // ═══════════════════════════════════════════════════════════
-    // Params-only endpoint — cheap, no tick data
     // ═══════════════════════════════════════════════════════════
 
     public ChainFilterParams fetchChainParams(Instrument instrument) throws Exception {
@@ -126,7 +121,6 @@ public class OptionsChainService {
                                             String strikeFilter)
             throws Exception {
 
-        // 1. Set market data type
         // MDT=4 (DELAYED_FROZEN) off-hours: works for both real-time and delayed-only subscribers.
         // IBKR delivers Greeks as fields 80/81/83 (delayed) or 10/11/13 (live, if subscription exists).
         boolean marketHours = schedule.isMarketHours();
@@ -137,19 +131,15 @@ public class OptionsChainService {
             ibkr.reqMarketDataType(MDT_LIVE);
         }
 
-        // 2. Get chain params — served from in-memory cache if still valid (avoids redundant IBKR call)
         ChainParams params = getCachedParams(instrument);
-
-        // 3. Fetch spot — chain centering and OTM% both depend on current spot
         double spot = resolveSpot(instrument, params, providedSpot);
 
-        // 4. Fetch from IBKR with configured filters
         // Off-hours: longer window gives delayed Greeks (field 83) time to arrive before timeout.
         int tickTimeout = marketHours ? WINDOW_MS : WINDOW_MS + 3500;
         List<OptionContract> contracts = fetchFromIbkr(
                 instrument, params, spot, expiry, includeMonthly, includeWeekly, strikeFilter, tickTimeout, marketHours);
 
-        // 5. Reset to live so unrelated reqMktData calls (e.g. spot fetch) get live data
+        // Reset to live so unrelated reqMktData calls (e.g. spot fetch) get live data
         ibkr.reqMarketDataType(MDT_LIVE);
 
         return contracts;
@@ -255,7 +245,6 @@ public class OptionsChainService {
                 strikes.isEmpty() ? "n/a" : strikes.get(0),
                 strikes.isEmpty() ? "n/a" : strikes.get(strikes.size() - 1));
 
-        // Build contract request list
         List<ContractRequest> requests = new ArrayList<>();
         for (String expiry : expiries)
             for (double strike : strikes) {

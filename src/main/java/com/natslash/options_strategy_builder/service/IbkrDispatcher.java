@@ -150,7 +150,7 @@ public class IbkrDispatcher extends DefaultEWrapper {
     }
 
     private CompletableFuture<TickData> reqMktDataInternal(Contract contract, int timeoutMs, String genericTicks) {
-        int reqId = reqIdCounter.getAndIncrement();
+        int reqId = nextReqId();
         TickAccumulator acc = new TickAccumulator();
         tickMap.put(reqId, acc);
 
@@ -291,11 +291,7 @@ public class IbkrDispatcher extends DefaultEWrapper {
             if (undPrice > 0 && Double.isFinite(undPrice))
                 acc.undPrice = undPrice;
 
-            // Mark that we have at least one successful Greek data point
             acc.greeksReceived = true;
-
-            // NOTE: We no longer call acc.future.complete() here.
-            // The reqMktData timeout now handles the completion.
         }
     }
 
