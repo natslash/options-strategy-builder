@@ -371,7 +371,10 @@ public class IbkrDispatcher extends DefaultEWrapper {
                 acc.future.complete(acc);
             }
         } else {
-            if (acc.last != null || acc.close != null) {
+            // Cash indices (e.g. SPX, ESTX50 IND) have no traded last price — IBKR only
+            // sends bid/ask. Complete as soon as we have any usable price.
+            if (acc.last != null || acc.close != null
+                    || (acc.bid != null && acc.ask != null)) {
                 acc.completionReason = "EARLY";
                 acc.future.complete(acc);
             }

@@ -197,12 +197,22 @@ public class OptionsChainService {
                 ibkr.reqUnderlyingPrice(buildUnderlyingContract(instrument), spotTimeout));
     }
 
-    /** Extracts last or close price from a tick. Returns empty if no usable price is available. */
+    /**
+     * Extracts spot price from a tick. Priority: last → close → mid(bid, ask).
+     * Cash indices (SPX, ESTX50 IND) have no traded last/close — IBKR only delivers
+     * bid/ask for them, so mid is used as the final fallback.
+     */
     private Optional<Double> extractSpot(TickData tick, String symbol) {
         if (tick == null) return Optional.empty();
-        Double price = (tick.last()  != null && tick.last()  > 0) ? tick.last()
-                     : (tick.close() != null && tick.close() > 0) ? tick.close()
-                     : null;
+        Double price;
+        if (tick.last() != null && tick.last() > 0)
+            price = tick.last();
+        else if (tick.close() != null && tick.close() > 0)
+            price = tick.close();
+        else if (tick.bid() != null && tick.ask() != null && tick.bid() > 0 && tick.ask() > 0)
+            price = (tick.bid() + tick.ask()) / 2.0;
+        else
+            price = null;
         if (price != null)
             log.info("Spot for {} from underlying market data: {}", symbol, price);
         return Optional.ofNullable(price);
