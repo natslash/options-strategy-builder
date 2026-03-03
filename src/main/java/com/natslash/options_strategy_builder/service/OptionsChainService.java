@@ -7,6 +7,7 @@ import com.natslash.options_strategy_builder.model.ChainFilterParams;
 import com.natslash.options_strategy_builder.model.ChainParams;
 import com.natslash.options_strategy_builder.model.OptionContract;
 import com.natslash.options_strategy_builder.model.TickData;
+import com.natslash.options_strategy_builder.model.TradingClassParams;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -248,35 +249,32 @@ public class OptionsChainService {
         }
         log.info("Expiries ({}): {}", expiries.size(), expiries);
 
-        // Filter strikes: ACTIVE = real gap around ATM within instrument.strikeRange%; ALL = every strike
-        List<Double> allAvailableStrikes = params.allStrikes().stream().sorted().toList();
-        log.info("IBKR strikes available: {} total, range {}-{}",
-                allAvailableStrikes.size(),
-                allAvailableStrikes.isEmpty() ? "n/a" : allAvailableStrikes.get(0),
-                allAvailableStrikes.isEmpty() ? "n/a" : allAvailableStrikes.get(allAvailableStrikes.size() - 1));
-
+        // Per-expiry strike resolution: use each expiry's own tradingClass grid to avoid
+        // IBKR error 200 from requesting strikes that don't exist in that series.
+        // The union (allStrikes) includes e.g. monthly 25pt strikes that are invalid for weekly expiries.
         int range = instrument.getStrikeRange() != null ? instrument.getStrikeRange() : DEFAULT_STRIKE_RANGE;
-        List<Double> strikes = "ALL".equals(strikeFilter)
-                ? allAvailableStrikes
-                : strikeByRange(allAvailableStrikes, spot, range);
-
-        // Cap to the user-requested count (clamped to server-side MAX_STRIKES_PER_EXPIRY).
-        int cap = Math.min(strikeCount, MAX_STRIKES_PER_EXPIRY);
-        if (strikes.size() > cap) {
-            strikes = centredSublist(strikes, spot, cap);
-            log.info("Strike list capped to {} around spot={}", cap, spot);
-        }
-        log.info("Spot={} strikeFilter={} range=±{}% → {} strikes (min={} max={})",
-                spot, strikeFilter, range, strikes.size(),
-                strikes.isEmpty() ? "n/a" : strikes.get(0),
-                strikes.isEmpty() ? "n/a" : strikes.get(strikes.size() - 1));
+        int cap   = Math.min(strikeCount, MAX_STRIKES_PER_EXPIRY);
 
         List<ContractRequest> requests = new ArrayList<>();
-        for (String expiry : expiries)
-            for (double strike : strikes) {
-                requests.add(new ContractRequest(expiry, strike, "C"));
-                requests.add(new ContractRequest(expiry, strike, "P"));
+        for (String expiry : expiries) {
+            TradingClassParams tc = params.forExpiry(expiry).orElse(null);
+            String tradingClass  = tc != null ? tc.tradingClass() : instrument.getTradingClass();
+            List<Double> expiryStrikes = (tc != null ? tc.strikes() : params.allStrikes())
+                    .stream().sorted().toList();
+
+            List<Double> filtered = "ALL".equals(strikeFilter)
+                    ? expiryStrikes
+                    : strikeByRange(expiryStrikes, spot, range);
+            if (filtered.size() > cap) filtered = centredSublist(filtered, spot, cap);
+
+            log.info("Expiry {}: tradingClass={} strikes {}/{} after filter (strikeFilter={} range=±{}% cap={})",
+                    expiry, tradingClass, filtered.size(), expiryStrikes.size(), strikeFilter, range, cap);
+            for (double strike : filtered) {
+                requests.add(new ContractRequest(expiry, strike, "C", tradingClass));
+                requests.add(new ContractRequest(expiry, strike, "P", tradingClass));
             }
+        }
+        log.info("Spot={} → {} total requests across {} expiries", spot, requests.size(), expiries.size());
 
         int multiplier = instrument.getMultiplier();
         long estimatedMs = (long)(requests.size() - 1) * RateLimitedRequestManager.RATE_MS + tickTimeoutMs;
@@ -416,11 +414,11 @@ public class OptionsChainService {
         c.strike(req.strike());
         c.right("C".equals(req.type()) ? Types.Right.Call : Types.Right.Put);
         c.multiplier(String.valueOf(instrument.getMultiplier()));
-        c.tradingClass(instrument.getTradingClass());
+        c.tradingClass(req.tradingClass());
         return c;
     }
 
-    private record ContractRequest(String expiry, double strike, String type) {}
+    private record ContractRequest(String expiry, double strike, String type, String tradingClass) {}
 
     // ═══════════════════════════════════════════════════════════
     // Strike range helper
