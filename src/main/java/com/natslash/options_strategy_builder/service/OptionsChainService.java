@@ -231,10 +231,12 @@ public class OptionsChainService {
         Contract c = new Contract();
         boolean hasFutures = instrument.getFuturesConId() != null;
         Integer cid = hasFutures ? instrument.getFuturesConId() : instrument.getConId();
-        log.debug("buildUnderlyingContract for {}: conId={} ({})",
-                instrument.getSymbol(), cid, hasFutures ? "futuresConId" : "instrument conId");
+        String secType = hasFutures ? "FUT" : instrument.getSecType() != null ? instrument.getSecType() : "IND";
+        log.info("buildUnderlyingContract for {}: conId={} ({}) secType={} exchange={}",
+                instrument.getSymbol(), cid, hasFutures ? "futuresConId" : "instrument conId",
+                secType, instrument.getExchange());
         c.conid(cid);
-        c.secType(hasFutures ? "FUT" : instrument.getSecType() != null ? instrument.getSecType() : "IND");
+        c.secType(secType);
         c.exchange(instrument.getExchange());
         return c;
     }
@@ -280,7 +282,11 @@ public class OptionsChainService {
         List<ContractRequest> requests = new ArrayList<>();
         for (String expiry : expiries) {
             TradingClassParams tc = params.forExpiry(expiry).orElse(null);
-            String tradingClass  = tc != null ? tc.tradingClass() : instrument.getTradingClass();
+            String tradingClass    = tc != null ? tc.tradingClass()     : instrument.getTradingClass();
+            // Use the actual options exchange from the secDefOptParams callback, not the instrument's
+            // underlying exchange. Critical for SMART-routed instruments (e.g. BAYN STK) where the
+            // underlying is on SMART but the options are listed on a different exchange (e.g. EUREX).
+            String optExchange     = tc != null ? tc.optionsExchange()  : instrument.getExchange();
             // Get the correct strike grid for this tradingClass, then remove fine near-ATM
             // theoretical strikes that IBKR returned but have no active contract.
             List<Double> expiryStrikes = filterToActiveGrid(
@@ -291,13 +297,13 @@ public class OptionsChainService {
                     : strikeByRange(expiryStrikes, spot, range);
             if (filtered.size() > totalCap) filtered = centredSublist(filtered, spot, totalCap);
 
-            log.info("Expiry {}: tradingClass={} grid={} → range={} → cap={} strikes (±{} per side)",
-                    expiry, tradingClass, expiryStrikes.size(), filtered.size() == expiryStrikes.size()
+            log.info("Expiry {}: tradingClass={} exchange={} grid={} → range={} → cap={} strikes (±{} per side)",
+                    expiry, tradingClass, optExchange, expiryStrikes.size(), filtered.size() == expiryStrikes.size()
                             ? filtered.size() : filtered.size() + "/" + expiryStrikes.size(),
                     filtered.size(), capPerSide);
             for (double strike : filtered) {
-                requests.add(new ContractRequest(expiry, strike, "C", tradingClass));
-                requests.add(new ContractRequest(expiry, strike, "P", tradingClass));
+                requests.add(new ContractRequest(expiry, strike, "C", tradingClass, optExchange));
+                requests.add(new ContractRequest(expiry, strike, "P", tradingClass, optExchange));
             }
         }
         log.info("Spot={} strikeCount={}±{}/side → {} total requests across {} expiries",
@@ -435,7 +441,7 @@ public class OptionsChainService {
         Contract c = new Contract();
         c.symbol(instrument.getSymbol());
         c.secType("OPT");
-        c.exchange(instrument.getExchange());
+        c.exchange(req.optionsExchange());
         c.currency(instrument.getCurrency());
         c.lastTradeDateOrContractMonth(req.expiry());
         c.strike(req.strike());
@@ -445,7 +451,7 @@ public class OptionsChainService {
         return c;
     }
 
-    private record ContractRequest(String expiry, double strike, String type, String tradingClass) {}
+    private record ContractRequest(String expiry, double strike, String type, String tradingClass, String optionsExchange) {}
 
     // ═══════════════════════════════════════════════════════════
     // Strike range helper

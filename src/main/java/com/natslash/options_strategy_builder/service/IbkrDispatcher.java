@@ -116,6 +116,7 @@ public class IbkrDispatcher extends DefaultEWrapper {
                     List<TradingClassParams> tradingClasses = a.byTradingClass.entrySet().stream()
                             .map(e -> new TradingClassParams(
                                     e.getKey(),
+                                    e.getValue().exchange,
                                     e.getValue().expirations.stream().sorted().toList(),
                                     e.getValue().strikes.stream().sorted().toList()))
                             .toList();
@@ -270,6 +271,7 @@ public class IbkrDispatcher extends DefaultEWrapper {
             return;
         ChainParamsAccumulator.TcEntry entry =
                 acc.byTradingClass.computeIfAbsent(tradingClass, k -> new ChainParamsAccumulator.TcEntry());
+        entry.exchange = exchange;  // actual listing exchange (may differ from underlying exchange)
         entry.expirations.addAll(expirations);
         entry.strikes.addAll(strikes);
     }
@@ -514,6 +516,7 @@ public class IbkrDispatcher extends DefaultEWrapper {
         ChainParamsAccumulator(String targetExchange) { this.targetExchange = targetExchange; }
 
         static class TcEntry {
+            volatile String   exchange;  // actual options exchange from secDefOptParams callback
             final Set<String> expirations = ConcurrentHashMap.newKeySet();
             final Set<Double>  strikes     = ConcurrentHashMap.newKeySet();
         }

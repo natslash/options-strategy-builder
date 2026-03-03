@@ -82,21 +82,24 @@ public class DiagnosticsController {
             return ResponseEntity.badRequest()
                     .body(Map.of("error", "Unknown mode: " + mode + ". Use LIVE|FROZEN|DELAYED|DELAYED_FROZEN"));
 
-        // Resolve tradingClass from cached params (avoids a redundant reqSecDefOptParams round-trip)
-        String tradingClass = instrument.getTradingClass(); // default fallback
+        // Resolve tradingClass and options exchange from cached params (avoids redundant secdef round-trip)
+        String tradingClass  = instrument.getTradingClass(); // default fallback
+        String optExchange   = instrument.getExchange();     // default fallback
         try {
             ChainParams params = chainService.chainParamsFor(instrument);
-            tradingClass = params.forExpiry(expiry)
-                    .map(TradingClassParams::tradingClass)
-                    .orElse(tradingClass);
+            TradingClassParams tc = params.forExpiry(expiry).orElse(null);
+            if (tc != null) {
+                tradingClass = tc.tradingClass();
+                if (tc.optionsExchange() != null) optExchange = tc.optionsExchange();
+            }
         } catch (Exception e) {
-            log.warn("Could not resolve tradingClass for expiry={} — using instrument default '{}': {}",
-                    expiry, tradingClass, e.getMessage());
+            log.warn("Could not resolve tradingClass for expiry={} — using instrument defaults: {}",
+                    expiry, e.getMessage());
         }
 
-        Contract contract = buildContract(instrument, expiry, strike, right, tradingClass);
-        log.info("Diagnostics tick: instrumentId={} expiry={} strike={} right={} mode={} tradingClass={}",
-                instrumentId, expiry, strike, right, mode, tradingClass);
+        Contract contract = buildContract(instrument, expiry, strike, right, tradingClass, optExchange);
+        log.info("Diagnostics tick: instrumentId={} expiry={} strike={} right={} mode={} tradingClass={} exchange={}",
+                instrumentId, expiry, strike, right, mode, tradingClass, optExchange);
 
         try {
             ibkr.reqMarketDataType(mdtCode);
@@ -147,11 +150,11 @@ public class DiagnosticsController {
     }
 
     private Contract buildContract(Instrument instrument, String expiry,
-                                   double strike, String right, String tradingClass) {
+                                   double strike, String right, String tradingClass, String optExchange) {
         Contract c = new Contract();
         c.symbol(instrument.getSymbol());
         c.secType("OPT");
-        c.exchange(instrument.getExchange());
+        c.exchange(optExchange);
         c.currency(instrument.getCurrency());
         c.lastTradeDateOrContractMonth(expiry);
         c.strike(strike);
