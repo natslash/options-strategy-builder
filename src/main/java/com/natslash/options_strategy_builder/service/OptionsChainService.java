@@ -24,7 +24,9 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class OptionsChainService {
 
-    private static final int    WINDOW_MS              = 1500;
+    // Collection window per reqMktData subscription. Greeks (tickOptionComputation fields 10/11/13)
+    // arrive after price ticks — 3000ms ensures they are captured before completeOnTimeout fires.
+    private static final int    WINDOW_MS              = 3000;
     private static final int    MAX_DTE_DAYS           = 180;
     // Hard cap per side (N below ATM + N above ATM). Total per expiry = cap*2+1.
     // Math: (cap*2)*20ms + WINDOW_MS = ~3.5s market hours, ~5.5s off-hours per expiry at cap=50.
@@ -61,16 +63,19 @@ public class OptionsChainService {
         ibkr.reqMarketDataType(marketHours ? MDT_LIVE : MDT_DELAYED_FROZEN);
 
         // Params first, then spot. Firing both concurrently caused the spot tick to arrive
-        // after the 1500ms timeout on a cold cache — reqSecDefOptParams (up to 30s) competes
+        // after the timeout on a cold cache — reqSecDefOptParams (up to 30s) competes
         // for the same IBKR connection and delays tickPrice callbacks.
         ChainParams params = getCachedParams(instrument);
-        // Off-hours: delayed-frozen data can take longer to arrive than real-time ticks.
-        int spotTimeout = marketHours ? WINDOW_MS : WINDOW_MS + 3500;
+        // Always use a generous timeout here: after reqSecDefOptParams the connection needs
+        // time to settle before IBKR responds to the next subscription. Off-hours adds extra.
+        int spotTimeout = marketHours ? WINDOW_MS + 2000 : WINDOW_MS + 5000;
         TickData spotTick = ibkr.reqUnderlyingPrice(buildUnderlyingContract(instrument), spotTimeout).join();
         List<Double> sortedStrikes = params.allStrikes().stream().sorted().toList();
-        double spot = extractSpot(spotTick, instrument.getSymbol())
-                .orElseThrow(() -> new RuntimeException(
-                        instrument.getSymbol() + ": no spot price from IBKR — check IBGW connection and market data subscription"));
+        Optional<Double> spotOpt = extractSpot(spotTick, instrument.getSymbol());
+        if (spotOpt.isEmpty())
+            log.warn("{}: spot unavailable after chain params fetch (timeout={}ms) — returning params without spot window. " +
+                    "IBKR connection may still be warming up; retry shortly.", instrument.getSymbol(), spotTimeout);
+        double spot = spotOpt.orElse(0.0);
 
         List<String> expiries = params.allExpirations().stream().sorted().toList();
         DoubleSummaryStatistics stats = params.allStrikes().stream()
