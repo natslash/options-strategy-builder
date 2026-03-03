@@ -257,9 +257,9 @@ public class IbkrDispatcher extends DefaultEWrapper {
         // Within the target exchange, keep each tradingClass separate (e.g. OESX monthly
         // at 25pt vs OESXW weekly at finer intervals) — merging them creates the same
         // superset problem across series.
-        log.debug("secDefOptParam reqId={} exchange={} tradingClass={} (target={}) strikes={}",
-                reqId, exchange, tradingClass, acc == null ? "n/a" : acc.targetExchange, strikes.size());
         if (acc == null) return;
+        log.info("secDefOptParam reqId={} exchange={} tradingClass={} strikes={} (targetExchange={})",
+                reqId, exchange, tradingClass, strikes.size(), acc.targetExchange);
         // SMART is a routing mechanism, not a real listing exchange. IBKR never returns "SMART"
         // in secDefOptParams callbacks — it returns the actual options exchange (e.g. EUREX for
         // BAYN STK). For SMART-routed instruments, accept any exchange so the chain is populated.
@@ -267,8 +267,11 @@ public class IbkrDispatcher extends DefaultEWrapper {
         // callback with a theoretical superset of strikes that don't exist as real contracts,
         // and mixing that superset with EUREX strikes causes error 200 on reqMktData.
         boolean smartRouting = "SMART".equalsIgnoreCase(acc.targetExchange);
-        if (!smartRouting && !acc.targetExchange.equalsIgnoreCase(exchange))
+        if (!smartRouting && !acc.targetExchange.equalsIgnoreCase(exchange)) {
+            log.info("secDefOptParam: skipping exchange={} (expected {}) for {}",
+                    exchange, acc.targetExchange, tradingClass);
             return;
+        }
         ChainParamsAccumulator.TcEntry entry =
                 acc.byTradingClass.computeIfAbsent(tradingClass, k -> new ChainParamsAccumulator.TcEntry());
         entry.exchange = exchange;  // actual listing exchange (may differ from underlying exchange)
