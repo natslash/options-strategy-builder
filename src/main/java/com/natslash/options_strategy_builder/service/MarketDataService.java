@@ -53,8 +53,8 @@ public class MarketDataService {
                 return Collections.emptyList();
             }
             ChainParams params =
-                    ibkr.reqChainParams(instrument.getSymbol(), instrument.getSecType(), instrument.getConId()).join();
-            return params.strikes();
+                    ibkr.reqChainParams(instrument.getSymbol(), instrument.getSecType(), instrument.getConId(), instrument.getExchange()).join();
+            return params.allStrikes();
         } catch (Exception e) {
             log.warn("Could not fetch strikes for instrumentId={}: {}", instrumentId, e.getMessage());
             return Collections.emptyList();

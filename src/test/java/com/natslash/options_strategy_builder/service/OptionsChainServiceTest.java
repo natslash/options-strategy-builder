@@ -1,7 +1,6 @@
 package com.natslash.options_strategy_builder.service;
 
 import com.natslash.options_strategy_builder.entity.Instrument;
-import com.natslash.options_strategy_builder.model.ChainParams;
 import com.natslash.options_strategy_builder.model.TickData;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -10,6 +9,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -27,7 +27,6 @@ class OptionsChainServiceTest {
     @InjectMocks OptionsChainService service;
 
     Instrument instrument;
-    ChainParams params;
 
     @BeforeEach
     void setUp() {
@@ -38,10 +37,6 @@ class OptionsChainServiceTest {
         instrument.setConId(12345);
         instrument.setMultiplier(100);
         instrument.setTradingClass("OESX");
-
-        params = new ChainParams(
-                List.of("20260320", "20260417"),
-                List.of(5000.0, 5500.0, 6000.0, 6500.0, 7000.0));
     }
 
     // ── resolveSpot priority ───────────────────────────────────────────────
@@ -55,7 +50,7 @@ class OptionsChainServiceTest {
         when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(tickWith(6200.0, null)));
 
-        double result = service.resolveSpot(instrument, params, 6124.85); // providedSpot ignored
+        double result = service.resolveSpot(instrument, null, 6124.85); // providedSpot ignored
 
         assertThat(result).isEqualTo(6200.0); // IBKR live price wins
     }
@@ -68,7 +63,7 @@ class OptionsChainServiceTest {
         when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(tickWith(6124.85, null)));
 
-        double result = service.resolveSpot(instrument, params, null);
+        double result = service.resolveSpot(instrument, null, null);
 
         assertThat(result).isEqualTo(6124.85);
     }
@@ -82,7 +77,7 @@ class OptionsChainServiceTest {
         when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(emptyTick()));
 
-        double result = service.resolveSpot(instrument, params, 6000.0);
+        double result = service.resolveSpot(instrument, null, 6000.0);
 
         assertThat(result).isEqualTo(6000.0);
     }
@@ -96,7 +91,7 @@ class OptionsChainServiceTest {
         when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(emptyTick()));
 
-        assertThatThrownBy(() -> service.resolveSpot(instrument, params, null))
+        assertThatThrownBy(() -> service.resolveSpot(instrument, null, (Double) null))
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("No spot price available");
     }
@@ -197,6 +192,67 @@ class OptionsChainServiceTest {
         List<Double> strikes = List.of(4900.0, 5000.0, 5100.0);
         List<Double> result = OptionsChainService.centredSublist(strikes, 5000.0, 10);
         assertThat(result).containsExactly(4900.0, 5000.0, 5100.0);
+    }
+
+    // ── filterToActiveGrid ─────────────────────────────────────────────────
+
+    /**
+     * OESX-like: outer zone (>10% from spot) at 50pt, near-ATM zone at 5pt.
+     * outerStep=50 → activeStep=25. Non-25pt near-ATM strikes are removed;
+     * 25pt boundaries and all outer strikes are retained.
+     */
+    @Test
+    void filterToActiveGrid_removesNearAtmFineStrikes() {
+        List<Double> strikes = new ArrayList<>();
+        // Outer left: 3000–4450 at 50pt (below 10% band of spot=5000 → lo=4500)
+        for (double s = 3000.0; s <= 4450.0; s += 50.0) strikes.add(s);
+        // Near-ATM: 4500–5500 at 5pt
+        for (double s = 4500.0; s <= 5500.0; s += 5.0)  strikes.add(s);
+        // Outer right: 5550–7000 at 50pt
+        for (double s = 5550.0; s <= 7000.0; s += 50.0) strikes.add(s);
+
+        List<Double> result = OptionsChainService.filterToActiveGrid(strikes, 5000.0);
+
+        // Non-25pt near-ATM strikes removed
+        assertThat(result).doesNotContain(4505.0, 4510.0, 4515.0, 4520.0,
+                4530.0, 4535.0, 4995.0, 5005.0, 5010.0);
+        // 25pt-boundary near-ATM strikes kept
+        assertThat(result).contains(4500.0, 4525.0, 4550.0, 4750.0, 5000.0, 5250.0, 5500.0);
+        // Outer strikes kept
+        assertThat(result).contains(3000.0, 3050.0, 7000.0);
+    }
+
+    /**
+     * Uniform 50pt grid throughout — no fine near-ATM zone.
+     * outerStep=50 → activeStep=25, but all 50pt strikes are multiples of 25 → nothing filtered.
+     */
+    @Test
+    void filterToActiveGrid_uniformGrid_passesAll() {
+        List<Double> strikes = new ArrayList<>();
+        for (double s = 4000.0; s <= 6000.0; s += 50.0) strikes.add(s);
+
+        List<Double> result = OptionsChainService.filterToActiveGrid(strikes, 5000.0);
+
+        assertThat(result).hasSize(strikes.size());
+    }
+
+    /**
+     * Fewer than 4 strikes — returned unchanged without computing outer step.
+     */
+    @Test
+    void filterToActiveGrid_tooFewStrikes_returnsUnchanged() {
+        List<Double> strikes = List.of(5000.0, 5025.0, 5050.0);
+        List<Double> result = OptionsChainService.filterToActiveGrid(strikes, 5025.0);
+        assertThat(result).containsExactly(5000.0, 5025.0, 5050.0);
+    }
+
+    /**
+     * Empty list — returns empty without error.
+     */
+    @Test
+    void filterToActiveGrid_emptyList_returnsEmpty() {
+        List<Double> result = OptionsChainService.filterToActiveGrid(new ArrayList<>(), 5000.0);
+        assertThat(result).isEmpty();
     }
 
     // ── helpers ───────────────────────────────────────────────────────────

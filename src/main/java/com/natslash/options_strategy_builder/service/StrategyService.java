@@ -78,8 +78,6 @@ public class StrategyService {
             }
         }
 
-        // ── New fields ─────────────────────────────────────────
-
         // Futures price (cached 60s) — non-blocking fallback to spot
         Double futuresPrice = marketDataService.getFuturesPrice(req.getInstrumentId());
         Double basisPct = (futuresPrice != null && spot > 0)
@@ -117,9 +115,20 @@ public class StrategyService {
             expectedMoveUp   = underlying + em;
             expectedMoveDown = underlying - em;
 
+            // Determine profit polarity: is the strategy profitable at the lowest spot price?
+            // This distinguishes "profit inside" (condor) from "profit outside" (straddle) shapes,
+            // and handles credit spreads that are always profitable (no break-evens).
+            boolean profitAtLeft = !spots.isEmpty() && pnlAtExpiry.get(spots.get(0)) > 0;
+
+            pop = probabilityEngine.computePop(breakEvenLow, breakEvenHigh, profitAtLeft, underlying, em);
+
+            // Break-evens are "safe" when they are well outside the 1-SD expected move.
+            // For profit-inside strategies (condor): both BEs must be outside ±1SD.
+            // For profit-outside strategies (straddle): both BEs must be inside ±1SD.
             if (breakEvenLow != null && breakEvenHigh != null) {
-                pop = probabilityEngine.probabilityBetween(breakEvenLow, breakEvenHigh, underlying, em);
-                breakEvensSafe = breakEvenLow < expectedMoveDown && breakEvenHigh > expectedMoveUp;
+                breakEvensSafe = !profitAtLeft
+                        ? breakEvenLow < expectedMoveDown && breakEvenHigh > expectedMoveUp
+                        : breakEvenLow > expectedMoveDown && breakEvenHigh < expectedMoveUp;
             }
         }
 

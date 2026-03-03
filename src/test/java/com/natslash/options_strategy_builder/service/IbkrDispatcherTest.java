@@ -194,6 +194,82 @@ class IbkrDispatcherTest {
     }
 
     /**
+     * IBKR sends Double.MAX_VALUE as a sentinel when a specific Greek cannot be computed
+     * (model convergence failure, deep-ITM/OTM, etc.). Double.MAX_VALUE is finite so
+     * Double.isFinite() does NOT filter it — it must be excluded explicitly.
+     * delta is valid here (0.55) so greeksReceived must still be true;
+     * gamma/vega/theta are MAX_VALUE and must be stored as null.
+     */
+    @Test
+    void maxValue_sentinel_filtered_to_null_for_gamma_vega_theta() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 50);
+
+        dispatcher.tickOptionComputation(reqId, 13, 0,
+                0.21, 0.55,                // valid IV + delta
+                2.50, 0,                   // optPrice, pvDividend
+                Double.MAX_VALUE,          // gamma — sentinel
+                Double.MAX_VALUE,          // vega  — sentinel
+                Double.MAX_VALUE,          // theta — sentinel (positive MAX_VALUE)
+                5835.0);
+
+        TickData result = future.join();
+        assertThat(result.delta()).isEqualTo(0.55);
+        assertThat(result.impliedVol()).isEqualTo(0.21);
+        // MAX_VALUE sentinels must be null, not 1.7976931348623157e+308
+        assertThat(result.gamma()).isNull();
+        assertThat(result.vega()).isNull();
+        assertThat(result.theta()).isNull();
+        // greeksReceived requires delta + gamma both non-null. delta is present but
+        // gamma=MAX_VALUE was filtered to null, so greeksReceived must be false.
+        assertThat(result.greeksReceived()).isFalse();
+    }
+
+    /**
+     * Field 13 (MODEL_OPTION) arrives with valid delta but MAX_VALUE gamma (model didn't converge).
+     * The future must NOT complete early at this point.
+     * Field 10 (BID_OPTION) then arrives with valid gamma/vega/theta.
+     * Only now should early completion fire, capturing the full Greek set from both fields.
+     */
+    @Test
+    void field13_maxValueGamma_doesNotCompleteEarly_field10_fills_gaps() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 5000);
+
+        // Price arrives first
+        dispatcher.tickPrice(reqId, 1, 174.40, null); // BID
+        dispatcher.tickPrice(reqId, 2, 177.60, null); // ASK
+        assertThat(future).isNotDone();
+
+        // Field 13: delta valid, gamma/vega/theta are MAX_VALUE sentinels
+        dispatcher.tickOptionComputation(reqId, 13, 0,
+                0.21, 0.53,            // IV + delta (valid)
+                2.50, 0,
+                Double.MAX_VALUE,      // gamma — sentinel
+                Double.MAX_VALUE,      // vega  — sentinel
+                Double.MAX_VALUE,      // theta — sentinel
+                5835.0);
+        // Must NOT complete — gamma is null so greeksReceived=false
+        assertThat(future).isNotDone();
+
+        // Field 10: bid-based computation delivers valid gamma/vega/theta
+        dispatcher.tickOptionComputation(reqId, 10, 0,
+                0.21, 0.53,
+                2.48, 0,
+                0.0009, 7.8, -1.40,    // gamma, vega, theta — all valid
+                5835.0);
+        // Now greeksReceived=true (delta + gamma both present) AND bid is set → early complete
+        assertThat(future).isDone();
+
+        TickData result = future.join();
+        assertThat(result.delta()).isEqualTo(0.53);
+        assertThat(result.gamma()).isEqualTo(0.0009);
+        assertThat(result.vega()).isEqualTo(7.8);
+        assertThat(result.theta()).isEqualTo(-1.40);
+        assertThat(result.greeksReceived()).isTrue();
+    }
+
+    /**
      * reqMktData sets expectGreeks=true. tryCompleteEarly requires BOTH greeksReceived AND
      * at least one price field. The future must stay pending after Greeks alone, then complete
      * immediately once a price tick also arrives — without waiting for the 5-second timeout.
