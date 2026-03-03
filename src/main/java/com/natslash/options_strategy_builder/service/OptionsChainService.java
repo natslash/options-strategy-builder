@@ -219,10 +219,15 @@ public class OptionsChainService {
     }
 
     /**
-     * Builds a contract that uniquely identifies the underlying by conId.
+     * Builds a contract for the underlying spot price subscription.
      * Prefers futuresConId (e.g. FESX for ESTX50) when set — futures contracts have broader
      * market data subscriptions and return live spot prices more reliably than index cash contracts.
-     * Falls back to conId for instruments without a linked futures contract (pure equities/ETFs).
+     * Falls back to instrument conId for instruments without a linked futures contract.
+     *
+     * <p>Exchange is intentionally NOT set: conId is globally unique and specifying the wrong
+     * exchange (e.g. "EUREX" for a cash index that IBKR routes through a different venue)
+     * causes error 200 "no security definition". secType IS set so IBKR does not mis-route
+     * IND contracts as STK.
      */
     private Contract buildUnderlyingContract(Instrument instrument) {
         Contract c = new Contract();
@@ -231,7 +236,7 @@ public class OptionsChainService {
         log.debug("buildUnderlyingContract for {}: conId={} ({})",
                 instrument.getSymbol(), cid, hasFutures ? "futuresConId" : "instrument conId");
         c.conid(cid);
-        c.exchange(instrument.getExchange());
+        c.secType(hasFutures ? "FUT" : instrument.getSecType() != null ? instrument.getSecType() : "IND");
         return c;
     }
 
