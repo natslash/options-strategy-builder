@@ -26,9 +26,9 @@ public class OptionsChainService {
 
     private static final int    WINDOW_MS              = 1500;
     private static final int    MAX_DTE_DAYS           = 180;
-    // Hard cap: prevents runaway fetches when strikeFilter=ALL returns hundreds of strikes.
-    // Math: (MAX_STRIKES-1)*20ms + WINDOW_MS = ~2.1s market hours, ~4.1s off-hours per expiry.
-    // Server-side cap — upper bound for user-selectable strike count.
+    // Hard cap per side (N below ATM + N above ATM). Total per expiry = cap*2+1.
+    // Math: (cap*2)*20ms + WINDOW_MS = ~3.5s market hours, ~5.5s off-hours per expiry at cap=50.
+    // Server-side cap — upper bound for user-selectable strikeCount (per-side).
     private static final int    MAX_STRIKES_PER_EXPIRY = 50;
     private static final long   PARAMS_CACHE_TTL_MS    = 60 * 60 * 1000L; // 1 hour
     private static final int    DEFAULT_STRIKE_RANGE   = 10; // ±10% of spot when instrument.strikeRange is null
@@ -251,30 +251,38 @@ public class OptionsChainService {
 
         // Per-expiry strike resolution: use each expiry's own tradingClass grid to avoid
         // IBKR error 200 from requesting strikes that don't exist in that series.
-        // The union (allStrikes) includes e.g. monthly 25pt strikes that are invalid for weekly expiries.
-        int range = instrument.getStrikeRange() != null ? instrument.getStrikeRange() : DEFAULT_STRIKE_RANGE;
-        int cap   = Math.min(strikeCount, MAX_STRIKES_PER_EXPIRY);
+        // The union (allStrikes) includes e.g. monthly 25pt strikes invalid for weekly expiries.
+        //
+        // strikeCount is per-side: strikeCount=15 → 15 below ATM + ATM + 15 above ATM.
+        int range      = instrument.getStrikeRange() != null ? instrument.getStrikeRange() : DEFAULT_STRIKE_RANGE;
+        int capPerSide = Math.min(strikeCount, MAX_STRIKES_PER_EXPIRY);
+        int totalCap   = capPerSide * 2 + 1; // ATM + N each side
 
         List<ContractRequest> requests = new ArrayList<>();
         for (String expiry : expiries) {
             TradingClassParams tc = params.forExpiry(expiry).orElse(null);
             String tradingClass  = tc != null ? tc.tradingClass() : instrument.getTradingClass();
-            List<Double> expiryStrikes = (tc != null ? tc.strikes() : params.allStrikes())
-                    .stream().sorted().toList();
+            // Get the correct strike grid for this tradingClass, then remove fine near-ATM
+            // theoretical strikes that IBKR returned but have no active contract.
+            List<Double> expiryStrikes = filterToActiveGrid(
+                    (tc != null ? tc.strikes() : params.allStrikes()).stream().sorted().toList(), spot);
 
             List<Double> filtered = "ALL".equals(strikeFilter)
                     ? expiryStrikes
                     : strikeByRange(expiryStrikes, spot, range);
-            if (filtered.size() > cap) filtered = centredSublist(filtered, spot, cap);
+            if (filtered.size() > totalCap) filtered = centredSublist(filtered, spot, totalCap);
 
-            log.info("Expiry {}: tradingClass={} strikes {}/{} after filter (strikeFilter={} range=±{}% cap={})",
-                    expiry, tradingClass, filtered.size(), expiryStrikes.size(), strikeFilter, range, cap);
+            log.info("Expiry {}: tradingClass={} grid={} → range={} → cap={} strikes (±{} per side)",
+                    expiry, tradingClass, expiryStrikes.size(), filtered.size() == expiryStrikes.size()
+                            ? filtered.size() : filtered.size() + "/" + expiryStrikes.size(),
+                    filtered.size(), capPerSide);
             for (double strike : filtered) {
                 requests.add(new ContractRequest(expiry, strike, "C", tradingClass));
                 requests.add(new ContractRequest(expiry, strike, "P", tradingClass));
             }
         }
-        log.info("Spot={} → {} total requests across {} expiries", spot, requests.size(), expiries.size());
+        log.info("Spot={} strikeCount={}±{}/side → {} total requests across {} expiries",
+                spot, capPerSide, capPerSide, requests.size(), expiries.size());
 
         int multiplier = instrument.getMultiplier();
         long estimatedMs = (long)(requests.size() - 1) * RateLimitedRequestManager.RATE_MS + tickTimeoutMs;
