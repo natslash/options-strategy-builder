@@ -258,7 +258,15 @@ public class IbkrDispatcher extends DefaultEWrapper {
         // superset problem across series.
         log.debug("secDefOptParam reqId={} exchange={} tradingClass={} (target={}) strikes={}",
                 reqId, exchange, tradingClass, acc == null ? "n/a" : acc.targetExchange, strikes.size());
-        if (acc == null || !acc.targetExchange.equalsIgnoreCase(exchange))
+        if (acc == null) return;
+        // SMART is a routing mechanism, not a real listing exchange. IBKR never returns "SMART"
+        // in secDefOptParams callbacks — it returns the actual options exchange (e.g. EUREX for
+        // BAYN STK). For SMART-routed instruments, accept any exchange so the chain is populated.
+        // For real exchanges (EUREX etc.), keep strict filtering — IBKR also fires a "SMART"
+        // callback with a theoretical superset of strikes that don't exist as real contracts,
+        // and mixing that superset with EUREX strikes causes error 200 on reqMktData.
+        boolean smartRouting = "SMART".equalsIgnoreCase(acc.targetExchange);
+        if (!smartRouting && !acc.targetExchange.equalsIgnoreCase(exchange))
             return;
         ChainParamsAccumulator.TcEntry entry =
                 acc.byTradingClass.computeIfAbsent(tradingClass, k -> new ChainParamsAccumulator.TcEntry());

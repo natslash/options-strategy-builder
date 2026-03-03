@@ -224,10 +224,8 @@ public class OptionsChainService {
      * market data subscriptions and return live spot prices more reliably than index cash contracts.
      * Falls back to instrument conId for instruments without a linked futures contract.
      *
-     * <p>Exchange is intentionally NOT set: conId is globally unique and specifying the wrong
-     * exchange (e.g. "EUREX" for a cash index that IBKR routes through a different venue)
-     * causes error 200 "no security definition". secType IS set so IBKR does not mis-route
-     * IND contracts as STK.
+     * <p>Cash indices (ESTX50, DAX, SPX) have no traded last/close — IBKR returns only bid/ask.
+     * {@link #tryCompleteEarly} and {@link #extractSpot} handle these via the mid(bid,ask) fallback.
      */
     private Contract buildUnderlyingContract(Instrument instrument) {
         Contract c = new Contract();
@@ -237,6 +235,7 @@ public class OptionsChainService {
                 instrument.getSymbol(), cid, hasFutures ? "futuresConId" : "instrument conId");
         c.conid(cid);
         c.secType(hasFutures ? "FUT" : instrument.getSecType() != null ? instrument.getSecType() : "IND");
+        c.exchange(instrument.getExchange());
         return c;
     }
 
