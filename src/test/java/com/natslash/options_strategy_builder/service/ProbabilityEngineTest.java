@@ -88,4 +88,71 @@ class ProbabilityEngineTest {
         double pUpper = engine.probabilityBetween(5000, 5200, underlying, em);
         assertThat(pLower).isCloseTo(pUpper, within(1e-9));
     }
+
+    // ── computePop ────────────────────────────────────────────
+
+    /** No break-evens, always profitable (credit spread / bull put spread) → 100%. */
+    @Test
+    void computePop_noBreakEvens_alwaysProfit_returnsOne() {
+        double p = engine.computePop(null, null, true, 5000, 286.0);
+        assertThat(p).isEqualTo(1.0);
+    }
+
+    /** No break-evens, always loss → 0%. */
+    @Test
+    void computePop_noBreakEvens_alwaysLoss_returnsZero() {
+        double p = engine.computePop(null, null, false, 5000, 286.0);
+        assertThat(p).isEqualTo(0.0);
+    }
+
+    /**
+     * One break-even, profitable below (long put / bear debit spread).
+     * BE at mean → P(S < mean) = 50%.
+     */
+    @Test
+    void computePop_oneBreakEven_profitBelow_returnsHalf() {
+        double p = engine.computePop(5000.0, null, true, 5000, 200.0);
+        assertThat(p).isCloseTo(0.50, within(1e-6));
+    }
+
+    /**
+     * One break-even, profitable above (long call / bull debit spread).
+     * BE at mean → P(S > mean) = 50%.
+     */
+    @Test
+    void computePop_oneBreakEven_profitAbove_returnsHalf() {
+        double p = engine.computePop(5000.0, null, false, 5000, 200.0);
+        assertThat(p).isCloseTo(0.50, within(1e-6));
+    }
+
+    /**
+     * Two break-evens, profit inside (short straddle / iron condor).
+     * ±1SD range → ~68%.
+     */
+    @Test
+    void computePop_twoBreakEvens_profitInside_returnsInsideProbability() {
+        double underlying = 5000, em = 200;
+        double p = engine.computePop(underlying - em, underlying + em, false, underlying, em);
+        assertThat(p).isCloseTo(0.6827, within(0.001));
+    }
+
+    /**
+     * Two break-evens, profit outside (long straddle / strangle).
+     * ±1SD range → ~32% (complement of 68%).
+     */
+    @Test
+    void computePop_twoBreakEvens_profitOutside_returnsOutsideProbability() {
+        double underlying = 5000, em = 200;
+        double p = engine.computePop(underlying - em, underlying + em, true, underlying, em);
+        assertThat(p).isCloseTo(1.0 - 0.6827, within(0.001));
+    }
+
+    /** Inside + outside probabilities must sum to 1. */
+    @Test
+    void computePop_insidePlusOutside_sumsToOne() {
+        double underlying = 5000, em = 200;
+        double inside  = engine.computePop(4700.0, 5300.0, false, underlying, em);
+        double outside = engine.computePop(4700.0, 5300.0, true,  underlying, em);
+        assertThat(inside + outside).isCloseTo(1.0, within(1e-9));
+    }
 }

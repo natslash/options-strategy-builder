@@ -2,8 +2,10 @@ package com.natslash.options_strategy_builder.service;
 
 import com.ib.client.*;
 import com.natslash.options_strategy_builder.model.ChainParams;
+import com.natslash.options_strategy_builder.model.DiagnosticTickData;
 import com.natslash.options_strategy_builder.model.HistoricalBar;
 import com.natslash.options_strategy_builder.model.TickData;
+import com.natslash.options_strategy_builder.model.TradingClassParams;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -100,9 +102,9 @@ public class IbkrDispatcher extends DefaultEWrapper {
      * Returns a future that completes with ChainParams, or completes
      * exceptionally with TimeoutException after 30 s.
      */
-    public CompletableFuture<ChainParams> reqChainParams(String symbol, String secType, int conId) {
+    public CompletableFuture<ChainParams> reqChainParams(String symbol, String secType, int conId, String exchange) {
         int reqId = nextReqId();
-        ChainParamsAccumulator acc = new ChainParamsAccumulator();
+        ChainParamsAccumulator acc = new ChainParamsAccumulator(exchange);
         chainParamMap.put(reqId, acc);
 
         log.info("reqSecDefOptParams reqId={} symbol={} conId={}", reqId, symbol, conId);
@@ -111,8 +113,21 @@ public class IbkrDispatcher extends DefaultEWrapper {
         return acc.future
                 .orTimeout(30, TimeUnit.SECONDS)
                 .thenApply(a -> {
-                    log.info("Chain params: {} expiries, {} strikes", a.expirations.size(), a.strikes.size());
-                    return new ChainParams(new ArrayList<>(a.expirations), new ArrayList<>(a.strikes));
+                    List<TradingClassParams> tradingClasses = a.byTradingClass.entrySet().stream()
+                            .map(e -> new TradingClassParams(
+                                    e.getKey(),
+                                    e.getValue().exchange,
+                                    e.getValue().expirations.stream().sorted().toList(),
+                                    e.getValue().strikes.stream().sorted().toList()))
+                            .toList();
+                    if (tradingClasses.isEmpty())
+                        log.warn("reqChainParams for {} returned 0 tradingClasses from exchange='{}' — " +
+                                "IBKR may use a different exchange name in its callback; check logs above",
+                                symbol, acc.targetExchange);
+                    tradingClasses.forEach(tc -> log.info(
+                            "Chain params (exchange={} tradingClass={}): {} expiries, {} strikes",
+                            acc.targetExchange, tc.tradingClass(), tc.expirations().size(), tc.strikes().size()));
+                    return new ChainParams(tradingClasses);
                 })
                 .whenComplete((r, ex) -> {
                     if (ex != null)
@@ -122,30 +137,61 @@ public class IbkrDispatcher extends DefaultEWrapper {
     }
 
     /**
-     * Requests market data for a specific contract and gathers results over a time
-     * window.
-     * * @param contract The option or index contract to fetch
-     * 
-     * @param timeoutMs The window (e.g., 1000-1500ms) to wait for the data burst to
-     *                  complete
-     * @return A future containing the aggregated TickData
+     * Requests market data for an option contract.
+     *
+     * <p>Streaming mode (snapshot=false) with generic ticks "100,101,106". Tick 106 (Option IV)
+     * triggers IBKR's server-side Black-Scholes model, emitting Greeks as field 13 (MODEL_OPTION)
+     * during live hours or field 83 (DELAYED_MODEL_OPTION) with MDT=4. The {@code completeOnTimeout}
+     * window collects the full data burst. {@code tickSnapshotEnd} is intentionally ignored — it
+     * fires as an IBKR quirk before Greeks arrive in streaming mode.
+     *
+     * <p>NOTE: snapshot=true is intentionally not supported here. IBKR error 321 rejects any
+     * combination of snapshot=true + non-empty genericTickList. Streaming mode handles both live
+     * and delayed (MDT=4) Greeks reliably within the timeout window.
      */
     public CompletableFuture<TickData> reqMktData(Contract contract, int timeoutMs) {
-        int reqId = reqIdCounter.getAndIncrement();
-        TickAccumulator acc = new TickAccumulator();
+        return reqMktDataInternal(contract, timeoutMs, "100,101,106");
+    }
+
+    /**
+     * Requests market data for an underlying (index/futures) contract — spot price only.
+     *
+     * <p>Uses empty genericTickList (underlying contracts are not options; option-specific
+     * generic ticks 100/101/106 are unnecessary). Price arrives via {@code tickPrice} callbacks:
+     * field 4 (last) or field 9 (close). Works in both live (MDT=1) and delayed-frozen (MDT=4) modes.
+     */
+    public CompletableFuture<TickData> reqUnderlyingPrice(Contract contract, int timeoutMs) {
+        return reqMktDataInternal(contract, timeoutMs, "");
+    }
+
+    /**
+     * Diagnostic variant of {@link #reqMktData} — returns an enriched result that includes
+     * the MDT mode IBKR actually confirmed for the subscription and the reason the future
+     * completed (EARLY = Greeks+price arrived, TIMEOUT = window expired, ERROR_XXX = IBKR error).
+     */
+    public CompletableFuture<DiagnosticTickData> reqMktDataDiagnostic(Contract contract, int timeoutMs) {
+        int reqId = nextReqId();
+        TickAccumulator acc = new TickAccumulator(true);
+        tickMap.put(reqId, acc);
+        client.reqMktData(reqId, contract, "100,101,106", false, false, Collections.emptyList());
+        acc.future.completeOnTimeout(acc, timeoutMs, TimeUnit.MILLISECONDS);
+        return acc.future
+                .thenApply(a -> new DiagnosticTickData(
+                        mapToTickData(a),
+                        a.confirmedMdt,
+                        a.completionReason != null ? a.completionReason : "TIMEOUT"))
+                .whenComplete((r, ex) -> {
+                    client.cancelMktData(reqId);
+                    tickMap.remove(reqId);
+                });
+    }
+
+    private CompletableFuture<TickData> reqMktDataInternal(Contract contract, int timeoutMs, String genericTicks) {
+        int reqId = nextReqId();
+        TickAccumulator acc = new TickAccumulator(!genericTicks.isEmpty());
         tickMap.put(reqId, acc);
 
-        // Generic tick "106" (Option Implied Volatility) tells IBKR to run its
-        // Black-Scholes model for the contract even when the market is closed.
-        // This is what causes tick type 13 (MODEL_OPTION Greeks) to arrive for
-        // contracts that have no live bid/ask — the key for off-hours Greek data.
-        // "100" = Historical Volatility (helps model seed), "101" = Open Interest.
-        // snapshot=false: keep subscription open until cancelMktData so the full
-        // model burst (Greeks + IV) has time to arrive before the timeout fires.
-        client.reqMktData(reqId, contract, "100,101,106", false, false, Collections.emptyList());
-
-        // Wait the full timeout window so Bid/Ask and Model Greeks all arrive before mapping.
-        // tickSnapshotEnd or error callbacks may complete the future earlier if applicable.
+        client.reqMktData(reqId, contract, genericTicks, false, false, Collections.emptyList());
         acc.future.completeOnTimeout(acc, timeoutMs, TimeUnit.MILLISECONDS);
 
         return acc.future
@@ -204,10 +250,33 @@ public class IbkrDispatcher extends DefaultEWrapper {
             String tradingClass, String multiplier,
             Set<String> expirations, Set<Double> strikes) {
         ChainParamsAccumulator acc = chainParamMap.get(reqId);
-        if (acc == null)
+        // Only use strikes from the target exchange. IBKR fires one callback per exchange
+        // (e.g. EUREX, SMART). SMART includes a theoretical superset — mixing it with
+        // EUREX results in 5-point strikes that don't exist as actual EUREX contracts,
+        // producing error 200 on every reqMktData for those strikes.
+        // Within the target exchange, keep each tradingClass separate (e.g. OESX monthly
+        // at 25pt vs OESXW weekly at finer intervals) — merging them creates the same
+        // superset problem across series.
+        if (acc == null) return;
+        log.info("secDefOptParam reqId={} exchange={} tradingClass={} strikes={} (targetExchange={})",
+                reqId, exchange, tradingClass, strikes.size(), acc.targetExchange);
+        // SMART is a routing mechanism, not a real listing exchange. IBKR never returns "SMART"
+        // in secDefOptParams callbacks — it returns the actual options exchange (e.g. EUREX for
+        // BAYN STK). For SMART-routed instruments, accept any exchange so the chain is populated.
+        // For real exchanges (EUREX etc.), keep strict filtering — IBKR also fires a "SMART"
+        // callback with a theoretical superset of strikes that don't exist as real contracts,
+        // and mixing that superset with EUREX strikes causes error 200 on reqMktData.
+        boolean smartRouting = "SMART".equalsIgnoreCase(acc.targetExchange);
+        if (!smartRouting && !acc.targetExchange.equalsIgnoreCase(exchange)) {
+            log.info("secDefOptParam: skipping exchange={} (expected {}) for {}",
+                    exchange, acc.targetExchange, tradingClass);
             return;
-        acc.expirations.addAll(expirations);
-        acc.strikes.addAll(strikes);
+        }
+        ChainParamsAccumulator.TcEntry entry =
+                acc.byTradingClass.computeIfAbsent(tradingClass, k -> new ChainParamsAccumulator.TcEntry());
+        entry.exchange = exchange;  // actual listing exchange (may differ from underlying exchange)
+        entry.expirations.addAll(expirations);
+        entry.strikes.addAll(strikes);
     }
 
     @Override
@@ -225,11 +294,12 @@ public class IbkrDispatcher extends DefaultEWrapper {
         if (acc == null || price <= 0)
             return;
         switch (field) {
-            case 1 -> acc.bid = price;
-            case 2 -> acc.ask = price;
-            case 4 -> acc.last = price;
-            case 9 -> acc.close = price;
+            case 1,  68 -> acc.bid   = price;  // BID / DELAYED_BID
+            case 2,  69 -> acc.ask   = price;  // ASK / DELAYED_ASK
+            case 4,  70 -> acc.last  = price;  // LAST / DELAYED_LAST
+            case 9,  75 -> acc.close = price;  // CLOSE / DELAYED_CLOSE
         }
+        tryCompleteEarly(acc);
     }
 
     @Override
@@ -238,10 +308,10 @@ public class IbkrDispatcher extends DefaultEWrapper {
         if (acc == null)
             return;
         switch (field) {
-            case 0 -> acc.bidSize = (int) size.longValue();
-            case 3 -> acc.askSize = (int) size.longValue();
-            case 8 -> acc.volume = (int) size.longValue();
-            case 22 -> acc.openInterest = (int) size.longValue();
+            case 0,  66 -> acc.bidSize      = (int) size.longValue();  // BID_SIZE / DELAYED_BID_SIZE
+            case 3,  67 -> acc.askSize      = (int) size.longValue();  // ASK_SIZE / DELAYED_ASK_SIZE
+            case 8,  74 -> acc.volume       = (int) size.longValue();  // VOLUME / DELAYED_VOLUME
+            case 22      -> acc.openInterest = (int) size.longValue();  // OPTION_OPEN_INTEREST
         }
     }
 
@@ -257,39 +327,78 @@ public class IbkrDispatcher extends DefaultEWrapper {
         if (acc == null)
             return;
 
-        // Field 13 = Model calculation (Server-side Black-Scholes)
-        // Field 10/11 = Bid/Ask based Greeks (Only available during market hours)
-        if (field == 13 || field == 10 || field == 11) {
-            // IBKR returns -1 or -2 for values that aren't yet calculated; we filter those
-            // out.
-            if (impliedVol > 0)
+        // Real-time (MDT 1/2): 10=BID_OPTION, 11=ASK_OPTION, 13=MODEL_OPTION
+        // Delayed  (MDT 3/4): 80=DELAYED_BID, 81=DELAYED_ASK, 83=DELAYED_MODEL_OPTION
+        // Field 83 is the primary carrier of off-hours Greeks when no real-time subscription exists.
+        if (field == 13 || field == 83 ||
+                field == 10 || field == 80 ||
+                field == 11 || field == 81) {
+            // IBKR returns -1/-2 for uncalculated values, Double.MAX_VALUE as a sentinel
+            // for "not available" (e.g. vega/theta/gamma when the model hasn't converged),
+            // and Double.POSITIVE_INFINITY for IV on deep-ITM/OTM options.
+            // Note: Double.isFinite(Double.MAX_VALUE) == true — MAX_VALUE is a valid finite
+            // number and must be excluded explicitly.
+            if (impliedVol > 0 && Double.isFinite(impliedVol) && impliedVol != Double.MAX_VALUE)
                 acc.impliedVol = impliedVol;
-            if (delta >= -1 && delta <= 1)
+            if (delta >= -1 && delta <= 1)    // bounds already exclude MAX_VALUE / Infinity
                 acc.delta = delta;
-            if (gamma > -2)
+            if (gamma > -2 && Double.isFinite(gamma) && gamma != Double.MAX_VALUE)
                 acc.gamma = gamma;
-            if (vega > -2)
+            if (vega  > -2 && Double.isFinite(vega)  && vega  != Double.MAX_VALUE)
                 acc.vega = vega;
-            if (theta > -2)
+            if (theta > -2 && Double.isFinite(theta) && theta != Double.MAX_VALUE)
                 acc.theta = theta;
-            if (optPrice > 0)
+            if (optPrice > 0 && Double.isFinite(optPrice) && optPrice != Double.MAX_VALUE)
                 acc.optPrice = optPrice;
-            if (undPrice > 0)
+            if (undPrice > 0 && Double.isFinite(undPrice) && undPrice != Double.MAX_VALUE)
                 acc.undPrice = undPrice;
 
-            // Mark that we have at least one successful Greek data point
-            acc.greeksReceived = true;
+            // IBKR fires up to three tickOptionComputation callbacks per contract:
+            //   field 10 = BID_OPTION  (Greeks from bid price)
+            //   field 11 = ASK_OPTION  (Greeks from ask price)
+            //   field 13 = MODEL_OPTION (server B-S model — may send MAX_VALUE for gamma/vega/theta
+            //                            when the model hasn't converged)
+            //
+            // Completing early on delta alone (from field 13) causes us to miss field 10/11
+            // which arrive later and carry the valid gamma/vega/theta. Require both delta AND
+            // gamma to be non-null before marking Greeks as complete — gamma being non-null
+            // confirms that a proper full computation (not just a delta-only model tick) has
+            // arrived.
+            if (acc.delta != null && acc.gamma != null) acc.greeksReceived = true;
+            tryCompleteEarly(acc);
+        }
+    }
 
-            // NOTE: We no longer call acc.future.complete() here.
-            // The reqMktData timeout now handles the completion.
+    /**
+     * Completes the accumulator's future early if enough data has arrived,
+     * saving the remainder of the WINDOW_MS timeout.
+     *
+     * Option contracts: complete when Greeks AND at least one price field are both present.
+     * Underlying contracts: complete as soon as last or close arrives (no Greeks expected).
+     */
+    private void tryCompleteEarly(TickAccumulator acc) {
+        if (acc.expectGreeks) {
+            if (acc.greeksReceived && (acc.bid != null || acc.ask != null
+                    || acc.last != null || acc.close != null)) {
+                acc.completionReason = "EARLY";
+                acc.future.complete(acc);
+            }
+        } else {
+            // Cash indices (e.g. SPX, ESTX50 IND) have no traded last price — IBKR only
+            // sends bid/ask. Complete as soon as we have any usable price.
+            if (acc.last != null || acc.close != null
+                    || (acc.bid != null && acc.ask != null)) {
+                acc.completionReason = "EARLY";
+                acc.future.complete(acc);
+            }
         }
     }
 
     @Override
     public void tickSnapshotEnd(int reqId) {
-        TickAccumulator acc = tickMap.remove(reqId);
-        if (acc != null)
-            acc.future.complete(acc);
+        // All requests use streaming mode (snapshot=false). tickSnapshotEnd is a known IBKR
+        // quirk that can fire before tickOptionComputation in streaming mode.
+        // Ignore it — completeOnTimeout owns completion.
     }
 
     @Override
@@ -310,10 +419,13 @@ public class IbkrDispatcher extends DefaultEWrapper {
         log.debug(">>> SUBSCRIPTION CHECK: ReqId {} is receiving {} data", reqId, typeStr);
 
         if (marketDataType >= 3) {
-            log.error("PERMISSIONS ALERT: ReqId {} is being downgraded to DELAYED. " +
-                    "This confirms IBKR does not recognize your real-time subscription " +
-                    "for this specific exchange/instrument.", reqId);
+            log.info("ReqId {} using {} data — no real-time subscription for this instrument; " +
+                    "delayed Greeks will arrive as fields 80/81/83 instead of 10/11/13.", reqId, typeStr);
         }
+
+        // Store confirmed mode so diagnostic callers can surface it in responses
+        TickAccumulator acc = tickMap.get(reqId);
+        if (acc != null) acc.confirmedMdt = marketDataType;
     }
 
     // ── Error handling ─────────────────────────────────────────
@@ -328,14 +440,19 @@ public class IbkrDispatcher extends DefaultEWrapper {
             if (cdAcc != null)
                 cdAcc.future.complete(cdAcc);
             TickAccumulator tickAcc = tickMap.remove(id);
-            if (tickAcc != null)
+            if (tickAcc != null) {
+                log.debug("Error 200 (no security definition) for tick reqId={} — " +
+                        "strike likely not an active contract in IBKR for this expiry/tradingClass", id);
+                tickAcc.completionReason = "ERROR_200";
                 tickAcc.future.complete(tickAcc);
+            }
             return;
         }
         // Unblock tick futures for any error so they don't wait for timeoutMs
         TickAccumulator tickAcc = tickMap.get(id);
         if (tickAcc != null) {
             log.warn("IBKR tick error id={} code={} msg={}", id, errorCode, errorMsg);
+            tickAcc.completionReason = "ERROR_" + errorCode;
             tickMap.remove(id);
             tickAcc.future.complete(tickAcc);
             return;
@@ -395,17 +512,30 @@ public class IbkrDispatcher extends DefaultEWrapper {
     }
 
     static class ChainParamsAccumulator {
-        final Set<String> expirations = ConcurrentHashMap.newKeySet();
-        final Set<Double> strikes = ConcurrentHashMap.newKeySet();
+        final Map<String, TcEntry> byTradingClass = new ConcurrentHashMap<>();
         final CompletableFuture<ChainParamsAccumulator> future = new CompletableFuture<>();
+        final String targetExchange;
+
+        ChainParamsAccumulator(String targetExchange) { this.targetExchange = targetExchange; }
+
+        static class TcEntry {
+            volatile String   exchange;  // actual options exchange from secDefOptParams callback
+            final Set<String> expirations = ConcurrentHashMap.newKeySet();
+            final Set<Double>  strikes     = ConcurrentHashMap.newKeySet();
+        }
     }
 
     static class TickAccumulator {
+        final boolean expectGreeks;
         volatile Double bid, ask, last, close, optPrice, undPrice;
         volatile Double impliedVol, delta, gamma, vega, theta;
         volatile int bidSize, askSize, volume, openInterest;
         volatile boolean greeksReceived;
         final CompletableFuture<TickAccumulator> future = new CompletableFuture<>();
+        volatile Integer confirmedMdt;      // set by marketDataType callback
+        volatile String  completionReason;  // EARLY | TIMEOUT | ERROR_200 | ERROR_XXX
+
+        TickAccumulator(boolean expectGreeks) { this.expectGreeks = expectGreeks; }
     }
 
     static class HistoricalDataAccumulator {

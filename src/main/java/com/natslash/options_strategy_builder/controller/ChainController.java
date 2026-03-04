@@ -178,7 +178,7 @@ public class ChainController {
             @RequestParam(defaultValue = "true")   boolean includeMonthly,
             @RequestParam(defaultValue = "false")  boolean includeWeekly,
             @RequestParam(defaultValue = "ACTIVE") String  strikeFilter,
-            @RequestParam(defaultValue = "25")     int     strikeCount) throws Exception { // must match OptionsChainService.DEFAULT_STRIKE_COUNT
+            @RequestParam(defaultValue = "25")     int     strikeCount) throws Exception {
 
         Instrument instrument = instrumentRepository.findById(instrumentId)
                 .orElseThrow(() -> new IllegalArgumentException("Instrument not found: " + instrumentId));

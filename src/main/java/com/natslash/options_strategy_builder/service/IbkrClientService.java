@@ -3,6 +3,7 @@ package com.natslash.options_strategy_builder.service;
 import com.ib.client.*;
 import com.natslash.options_strategy_builder.config.IbkrProperties;
 import com.natslash.options_strategy_builder.model.ChainParams;
+import com.natslash.options_strategy_builder.model.DiagnosticTickData;
 import com.natslash.options_strategy_builder.model.HistoricalBar;
 import com.natslash.options_strategy_builder.model.TickData;
 import lombok.extern.slf4j.Slf4j;
@@ -116,14 +117,24 @@ public class IbkrClientService {
         return dispatcher.reqContractDetails(symbol, secType);
     }
 
-    public CompletableFuture<ChainParams> reqChainParams(String symbol, String secType, int conId) {
+    public CompletableFuture<ChainParams> reqChainParams(String symbol, String secType, int conId, String exchange) {
         requireConnected();
-        return dispatcher.reqChainParams(symbol, secType, conId);
+        return dispatcher.reqChainParams(symbol, secType, conId, exchange);
     }
 
     public CompletableFuture<TickData> reqMktData(Contract contract, int timeoutMs) {
         if (!isConnected()) return CompletableFuture.completedFuture(TickData.EMPTY);
         return dispatcher.reqMktData(contract, timeoutMs);
+    }
+
+    public CompletableFuture<TickData> reqUnderlyingPrice(Contract contract, int timeoutMs) {
+        if (!isConnected()) return CompletableFuture.completedFuture(TickData.EMPTY);
+        return dispatcher.reqUnderlyingPrice(contract, timeoutMs);
+    }
+
+    public CompletableFuture<DiagnosticTickData> reqMktDataDiagnostic(Contract contract, int timeoutMs) {
+        requireConnected();
+        return dispatcher.reqMktDataDiagnostic(contract, timeoutMs);
     }
 
     public CompletableFuture<List<HistoricalBar>> reqHistoricalData(

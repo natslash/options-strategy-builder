@@ -1,7 +1,6 @@
 package com.natslash.options_strategy_builder.service;
 
 import com.natslash.options_strategy_builder.entity.Instrument;
-import com.natslash.options_strategy_builder.model.ChainParams;
 import com.natslash.options_strategy_builder.model.TickData;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -10,6 +9,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -27,7 +27,6 @@ class OptionsChainServiceTest {
     @InjectMocks OptionsChainService service;
 
     Instrument instrument;
-    ChainParams params;
 
     @BeforeEach
     void setUp() {
@@ -38,111 +37,221 @@ class OptionsChainServiceTest {
         instrument.setConId(12345);
         instrument.setMultiplier(100);
         instrument.setTradingClass("OESX");
-
-        params = new ChainParams(
-                List.of("20260320", "20260417"),
-                List.of(5000.0, 5500.0, 6000.0, 6500.0, 7000.0));
     }
 
     // ── resolveSpot priority ───────────────────────────────────────────────
 
     /**
-     * Reveals the production bug: IBKR index returns stale close (last=null, close=4360)
-     * while the frontend already sent the correct live spot (6124.85).
-     * After the fix, providedSpot must take priority over any IBKR value.
+     * IBKR is always the primary source. Even when providedSpot is supplied (from a prior
+     * fetchChainParams call), the live IBKR price must win — providedSpot may be stale.
      */
     @Test
-    void resolveSpot_returnsProvidedSpot_notStaleIbkrClose() throws Exception {
-        // lenient: providedSpot > 0 short-circuits before any IBKR call
-        lenient().when(ibkr.reqMktData(any(), anyInt()))
-                .thenReturn(CompletableFuture.completedFuture(tickWith(null, 4360.0)));
+    void resolveSpot_alwaysUsesIbkrSpot_ignoresProvidedSpot() throws Exception {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
+                .thenReturn(CompletableFuture.completedFuture(tickWith(6200.0, null)));
 
-        double result = service.resolveSpot(instrument, params, 6124.85);
+        double result = service.resolveSpot(instrument, null, 6124.85); // providedSpot ignored
 
-        assertThat(result).isEqualTo(6124.85);
+        assertThat(result).isEqualTo(6200.0); // IBKR live price wins
     }
 
     /**
-     * When no spot is provided, live IBKR underlying price is fetched and used.
-     * The underlying contract uses the 2-param reqMktData (snapshot=true).
+     * No providedSpot — IBKR last price is fetched and returned directly.
      */
     @Test
-    void resolveSpot_fetchesLiveIbkrSpot_whenNoProvidedSpot() throws Exception {
-        // 2-param: underlying contract (snapshot=true, fast frozen close)
-        when(ibkr.reqMktData(any(), anyInt()))
+    void resolveSpot_fetchesIbkrSpot_whenNoProvidedSpot() throws Exception {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(tickWith(6124.85, null)));
 
-        double result = service.resolveSpot(instrument, params, null);
+        double result = service.resolveSpot(instrument, null, null);
 
         assertThat(result).isEqualTo(6124.85);
     }
 
     /**
-     * When IBKR has no price (off-hours, no subscription), falls back to median strike.
-     * params has 5 strikes: [5000, 5500, 6000, 6500, 7000] → median = index 2 = 6000.
-     * Chain fetch never fails due to missing spot data.
+     * IBKR returns no price (disconnected / no subscription) — providedSpot is accepted
+     * as a fallback so the chain fetch can still proceed with the last known value.
      */
     @Test
-    void resolveSpot_usesMedianStrike_whenIbkrUnavailable() {
-        when(ibkr.reqMktData(any(), anyInt()))
+    void resolveSpot_usesProvidedSpot_whenIbkrReturnsNoPrice() {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(emptyTick()));
 
-        double result = service.resolveSpot(instrument, params, null);
+        double result = service.resolveSpot(instrument, null, 6000.0);
 
-        assertThat(result).isEqualTo(6000.0); // median of [5000,5500,6000,6500,7000]
+        assertThat(result).isEqualTo(6000.0);
     }
 
     /**
-     * RuntimeException is only thrown when strikes are empty — means there's genuinely
-     * nothing to show (no chain data at all), not just missing market data.
+     * IBKR unavailable AND no providedSpot — must throw, not fall back to median strike.
+     * Median-strike fallback produced inaccurate OTM% and silently misled the user.
      */
     @Test
-    void resolveSpot_throws_whenNoStrikesAvailable() {
-        when(ibkr.reqMktData(any(), anyInt()))
+    void resolveSpot_throws_whenIbkrUnavailableAndNoProvidedSpot() {
+        when(ibkr.reqUnderlyingPrice(any(), anyInt()))
                 .thenReturn(CompletableFuture.completedFuture(emptyTick()));
-        ChainParams emptyParams = new ChainParams(List.of("20260320"), List.of());
 
-        assertThatThrownBy(() -> service.resolveSpot(instrument, emptyParams, null))
+        assertThatThrownBy(() -> service.resolveSpot(instrument, null, (Double) null))
                 .isInstanceOf(RuntimeException.class)
-                .hasMessageContaining("No strikes available");
+                .hasMessageContaining("No spot price available");
     }
 
-    // ── strikeWindow ──────────────────────────────────────────────────────
+    // ── strikeByRange ──────────────────────────────────────────────────────
 
+    /**
+     * Spot=5000, ±10% → lo=4500, hi=5500. Strikes at 4500/5000/5500 are included (inclusive bounds).
+     * Strikes at 4000 and 6000 are outside the range.
+     */
     @Test
-    void strikeWindow_spotInMiddle_returnsExactCount() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
-        // spot=4.0 at idx=3, count=4 → half=2, from=max(0,3-2)=1, to=min(7,1+4)=5, from=max(0,5-4)=1
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 4.0, 4);
-        assertThat(result).hasSize(4).containsExactly(2.0, 3.0, 4.0, 5.0);
+    void strikeByRange_returnsStrikesWithinPercentRange() {
+        List<Double> strikes = List.of(4000.0, 4500.0, 5000.0, 5500.0, 6000.0);
+        List<Double> result = OptionsChainService.strikeByRange(strikes, 5000.0, 10);
+        assertThat(result).containsExactly(4500.0, 5000.0, 5500.0);
     }
 
+    /**
+     * The count emerges from the actual strike gap — no forced window size.
+     * ESTX50-like: spot=5000, gap=25pts, ±10% → ~(1000/25)=40 strikes.
+     */
     @Test
-    void strikeWindow_spotAtMinimum_windowStartsAtIndex0() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0);
-        // spot below list → insertion point 0
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 0.5, 3);
-        assertThat(result).hasSize(3).containsExactly(1.0, 2.0, 3.0);
-    }
-
-    @Test
-    void strikeWindow_spotAtMaximum_windowEndsAtLastIndex() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0, 4.0, 5.0);
-        // spot above list → insertion point = size → clamped to size-1
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 6.0, 3);
-        assertThat(result).hasSize(3).containsExactly(3.0, 4.0, 5.0);
-    }
-
-    @Test
-    void strikeWindow_countExceedsListSize_returnsWholeList() {
-        List<Double> strikes = List.of(1.0, 2.0, 3.0);
-        List<Double> result = OptionsChainService.strikeWindow(strikes, 2.0, 10);
-        assertThat(result).hasSize(3).containsExactly(1.0, 2.0, 3.0);
+    void strikeByRange_countReflectsRealGap() {
+        // Simulate 25-point ESTX50 grid from 4000 to 6000
+        List<Double> strikes = new java.util.ArrayList<>();
+        for (double s = 4000.0; s <= 6000.0; s += 25.0) strikes.add(s);
+        List<Double> result = OptionsChainService.strikeByRange(strikes, 5000.0, 10);
+        // ±10% of 5000 = 4500–5500, 25-point gap → 41 strikes
+        assertThat(result.get(0)).isGreaterThanOrEqualTo(4500.0);
+        assertThat(result.get(result.size() - 1)).isLessThanOrEqualTo(5500.0);
+        assertThat(result.size()).isGreaterThan(30); // real gap produces real count, not a fixed 25
     }
 
     @Test
-    void strikeWindow_emptyList_returnsEmpty() {
-        List<Double> result = OptionsChainService.strikeWindow(List.of(), 5000.0, 25);
+    void strikeByRange_spotBelowAllStrikes_returnsEmpty() {
+        List<Double> strikes = List.of(5000.0, 5100.0, 5200.0);
+        // spot=100 ±10% → lo=90, hi=110 — no strikes in that range
+        List<Double> result = OptionsChainService.strikeByRange(strikes, 100.0, 10);
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void strikeByRange_emptyList_returnsEmpty() {
+        List<Double> result = OptionsChainService.strikeByRange(List.of(), 5000.0, 10);
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void strikeByRange_zeroRange_returnsEmpty() {
+        List<Double> result = OptionsChainService.strikeByRange(List.of(5000.0), 5000.0, 0);
+        assertThat(result).isEmpty();
+    }
+
+    // ── centredSublist ─────────────────────────────────────────────────────
+
+    /**
+     * Standard case: ATM at index 4 (5000.0), cap=4.
+     * half=2, start=max(0,4-2)=2, end=min(10,2+4)=6 → [4800, 4900, 5000, 5100].
+     */
+    @Test
+    void centredSublist_returnsStrikesCentredAroundAtm() {
+        List<Double> strikes = List.of(4600.0, 4700.0, 4800.0, 4900.0, 5000.0,
+                                       5100.0, 5200.0, 5300.0, 5400.0, 5500.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5000.0, 4);
+        assertThat(result).containsExactly(4800.0, 4900.0, 5000.0, 5100.0);
+    }
+
+    /**
+     * ATM near the start: window clamps at index 0 and shifts right.
+     * strikes=[5000,5100,5200,5300,5400], ATM=index 0, cap=4
+     * start=max(0,0-2)=0, end=min(5,0+4)=4 → [5000, 5100, 5200, 5300].
+     */
+    @Test
+    void centredSublist_atmNearStart_doesNotGoNegative() {
+        List<Double> strikes = List.of(5000.0, 5100.0, 5200.0, 5300.0, 5400.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5000.0, 4);
+        assertThat(result).hasSize(4);
+        assertThat(result.get(0)).isEqualTo(5000.0);
+    }
+
+    /**
+     * ATM near the end: window clamps at the last index and shifts left.
+     * strikes=[4700,4800,4900,5000,5100], ATM=index 4 (5100), cap=4
+     * start=max(0,4-2)=2, end=min(5,2+4)=5, start=max(0,5-4)=1 → [4800,4900,5000,5100].
+     */
+    @Test
+    void centredSublist_atmNearEnd_shiftsWindowLeft() {
+        List<Double> strikes = List.of(4700.0, 4800.0, 4900.0, 5000.0, 5100.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5100.0, 4);
+        assertThat(result).containsExactly(4800.0, 4900.0, 5000.0, 5100.0);
+    }
+
+    /**
+     * Total strikes fewer than cap — all are returned unchanged.
+     */
+    @Test
+    void centredSublist_fewerStrikesThanCap_returnsAll() {
+        List<Double> strikes = List.of(4900.0, 5000.0, 5100.0);
+        List<Double> result = OptionsChainService.centredSublist(strikes, 5000.0, 10);
+        assertThat(result).containsExactly(4900.0, 5000.0, 5100.0);
+    }
+
+    // ── filterToActiveGrid ─────────────────────────────────────────────────
+
+    /**
+     * OESX-like: outer zone (>10% from spot) at 50pt, near-ATM zone at 5pt.
+     * outerStep=50 → activeStep=25. Non-25pt near-ATM strikes are removed;
+     * 25pt boundaries and all outer strikes are retained.
+     */
+    @Test
+    void filterToActiveGrid_removesNearAtmFineStrikes() {
+        List<Double> strikes = new ArrayList<>();
+        // Outer left: 3000–4450 at 50pt (below 10% band of spot=5000 → lo=4500)
+        for (double s = 3000.0; s <= 4450.0; s += 50.0) strikes.add(s);
+        // Near-ATM: 4500–5500 at 5pt
+        for (double s = 4500.0; s <= 5500.0; s += 5.0)  strikes.add(s);
+        // Outer right: 5550–7000 at 50pt
+        for (double s = 5550.0; s <= 7000.0; s += 50.0) strikes.add(s);
+
+        List<Double> result = OptionsChainService.filterToActiveGrid(strikes, 5000.0);
+
+        // Non-25pt near-ATM strikes removed
+        assertThat(result).doesNotContain(4505.0, 4510.0, 4515.0, 4520.0,
+                4530.0, 4535.0, 4995.0, 5005.0, 5010.0);
+        // 25pt-boundary near-ATM strikes kept
+        assertThat(result).contains(4500.0, 4525.0, 4550.0, 4750.0, 5000.0, 5250.0, 5500.0);
+        // Outer strikes kept
+        assertThat(result).contains(3000.0, 3050.0, 7000.0);
+    }
+
+    /**
+     * Uniform 50pt grid throughout — no fine near-ATM zone.
+     * outerStep=50 → activeStep=25, but all 50pt strikes are multiples of 25 → nothing filtered.
+     */
+    @Test
+    void filterToActiveGrid_uniformGrid_passesAll() {
+        List<Double> strikes = new ArrayList<>();
+        for (double s = 4000.0; s <= 6000.0; s += 50.0) strikes.add(s);
+
+        List<Double> result = OptionsChainService.filterToActiveGrid(strikes, 5000.0);
+
+        assertThat(result).hasSize(strikes.size());
+    }
+
+    /**
+     * Fewer than 4 strikes — returned unchanged without computing outer step.
+     */
+    @Test
+    void filterToActiveGrid_tooFewStrikes_returnsUnchanged() {
+        List<Double> strikes = List.of(5000.0, 5025.0, 5050.0);
+        List<Double> result = OptionsChainService.filterToActiveGrid(strikes, 5025.0);
+        assertThat(result).containsExactly(5000.0, 5025.0, 5050.0);
+    }
+
+    /**
+     * Empty list — returns empty without error.
+     */
+    @Test
+    void filterToActiveGrid_emptyList_returnsEmpty() {
+        List<Double> result = OptionsChainService.filterToActiveGrid(new ArrayList<>(), 5000.0);
         assertThat(result).isEmpty();
     }
 

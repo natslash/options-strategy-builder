@@ -26,12 +26,12 @@ class IbkrDispatcherTest {
         dispatcher.setClient(mockClient);
     }
 
-    // ── Snapshot wire format ────────────────────────────────────
+    // ── Wire format ─────────────────────────────────────────────
 
     /**
-     * Streaming mode with model-Greek tick list: snapshot=false,
-     * genericTickList="100,101,106" (106 = Option Implied Volatility forces IBKR
-     * to run Black-Scholes and emit tick type 13 MODEL_OPTION for off-hours contracts).
+     * Option market data: streaming mode, snapshot=false,
+     * genericTickList="100,101,106" (106 = Option Implied Volatility triggers IBKR
+     * server-side Black-Scholes → emits field 13 live, field 83 delayed).
      */
     @Test
     void reqMktData_uses_streaming_with_model_greek_ticks() {
@@ -42,11 +42,25 @@ class IbkrDispatcherTest {
                 eq(false), eq(false), any());
     }
 
-    // ── Early completion via tickOptionComputation ─────────────
+    /**
+     * Underlying price fetch: streaming mode, snapshot=false,
+     * genericTickList="" — option-specific generic ticks are unnecessary
+     * and would cause IBKR error 321 if combined with snapshot=true.
+     */
+    @Test
+    void reqUnderlyingPrice_sends_no_generic_ticks() {
+        dispatcher.reqUnderlyingPrice(mockContract, 5000);
+
+        verify(mockClient).reqMktData(
+                anyInt(), eq(mockContract), eq(""),
+                eq(false), eq(false), any());
+    }
+
+    // ── Greeks via tickOptionComputation ────────────────────────
 
     /**
-     * Field 13 = MODEL_OPTION. Full window elapses then Greeks are present in result.
-     * Uses short timeout so test completes quickly.
+     * Field 13 = MODEL_OPTION (live hours). Future completes via timeout;
+     * greeksReceived must be true.
      */
     @Test
     void greeksReceived_true_forModelField_13() {
@@ -62,7 +76,7 @@ class IbkrDispatcherTest {
     }
 
     /**
-     * Field 10 = BID_OPTION — arrives in frozen snapshots when MODEL is unavailable off-hours.
+     * Field 10 = BID_OPTION — arrives when MODEL is unavailable off-hours.
      */
     @Test
     void greeksReceived_true_forBidOptionField_10() {
@@ -92,8 +106,26 @@ class IbkrDispatcherTest {
     }
 
     /**
-     * Full window collects both field 10 and field 13. Field 13 (MODEL) arrives last
-     * and overwrites field 10 values — model wins when both are present.
+     * Field 83 = DELAYED_MODEL_OPTION. Used when IBKR operates in MDT=3/4 (delayed) mode.
+     * Same streaming mode as live hours — completes via timeout, not tickSnapshotEnd.
+     */
+    @Test
+    void delayed_model_field83_greeksReceived_true() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 50);
+
+        dispatcher.tickOptionComputation(reqId, 83, 0,
+                0.22, 0.38, 2.40, 0, 0.015, 0.008, -0.04, 4900.0);
+        dispatcher.tickSnapshotEnd(reqId); // IBKR quirk — must be ignored in streaming mode
+
+        TickData result = future.join(); // completes via 50ms timeout
+        assertThat(result.greeksReceived()).isTrue();
+        assertThat(result.delta()).isEqualTo(0.38);
+        assertThat(result.impliedVol()).isEqualTo(0.22);
+    }
+
+    /**
+     * Field 13 (MODEL) overwrites field 10 (BID_OPTION) when both arrive in the same window.
      */
     @Test
     void field13_overwrites_field10_within_window() {
@@ -118,5 +150,144 @@ class IbkrDispatcherTest {
         CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 50);
 
         assertThat(future.join().greeksReceived()).isFalse();
+    }
+
+    // ── tickSnapshotEnd (streaming mode) ────────────────────────
+
+    /**
+     * tickSnapshotEnd is an IBKR quirk that fires before tickOptionComputation in streaming mode.
+     * It must be ignored so Greeks arriving after it are still captured in the timeout window.
+     */
+    @Test
+    void tickSnapshotEnd_ignored_in_streaming_mode_greeks_still_captured() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> streamFuture = dispatcher.reqMktData(mockContract, 200);
+
+        // IBKR quirk: tickSnapshotEnd fires before tickOptionComputation
+        dispatcher.tickSnapshotEnd(reqId);
+        assertThat(streamFuture).isNotDone(); // must still be running
+
+        // Greeks arrive after the premature tickSnapshotEnd
+        dispatcher.tickOptionComputation(reqId, 13, 0,
+                0.20, 0.45, 2.50, 0, 0.02, 0.01, -0.05, 5000.0);
+
+        TickData result = streamFuture.join(); // completes via 200ms timeout
+        assertThat(result.greeksReceived()).isTrue();
+        assertThat(result.delta()).isEqualTo(0.45);
+    }
+
+    // ── Early completion ─────────────────────────────────────────
+
+    /**
+     * reqUnderlyingPrice sets expectGreeks=false. tryCompleteEarly fires as soon as
+     * a last/close price arrives — the future must complete before the 5-second timeout.
+     */
+    @Test
+    void reqUnderlyingPrice_completes_early_on_price_arrival() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqUnderlyingPrice(mockContract, 5000);
+
+        dispatcher.tickPrice(reqId, 4, 6200.0, null); // field 4 = LAST
+
+        assertThat(future).isDone();
+        assertThat(future.join().last()).isEqualTo(6200.0);
+    }
+
+    /**
+     * IBKR sends Double.MAX_VALUE as a sentinel when a specific Greek cannot be computed
+     * (model convergence failure, deep-ITM/OTM, etc.). Double.MAX_VALUE is finite so
+     * Double.isFinite() does NOT filter it — it must be excluded explicitly.
+     * delta is valid here (0.55) so greeksReceived must still be true;
+     * gamma/vega/theta are MAX_VALUE and must be stored as null.
+     */
+    @Test
+    void maxValue_sentinel_filtered_to_null_for_gamma_vega_theta() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 50);
+
+        dispatcher.tickOptionComputation(reqId, 13, 0,
+                0.21, 0.55,                // valid IV + delta
+                2.50, 0,                   // optPrice, pvDividend
+                Double.MAX_VALUE,          // gamma — sentinel
+                Double.MAX_VALUE,          // vega  — sentinel
+                Double.MAX_VALUE,          // theta — sentinel (positive MAX_VALUE)
+                5835.0);
+
+        TickData result = future.join();
+        assertThat(result.delta()).isEqualTo(0.55);
+        assertThat(result.impliedVol()).isEqualTo(0.21);
+        // MAX_VALUE sentinels must be null, not 1.7976931348623157e+308
+        assertThat(result.gamma()).isNull();
+        assertThat(result.vega()).isNull();
+        assertThat(result.theta()).isNull();
+        // greeksReceived requires delta + gamma both non-null. delta is present but
+        // gamma=MAX_VALUE was filtered to null, so greeksReceived must be false.
+        assertThat(result.greeksReceived()).isFalse();
+    }
+
+    /**
+     * Field 13 (MODEL_OPTION) arrives with valid delta but MAX_VALUE gamma (model didn't converge).
+     * The future must NOT complete early at this point.
+     * Field 10 (BID_OPTION) then arrives with valid gamma/vega/theta.
+     * Only now should early completion fire, capturing the full Greek set from both fields.
+     */
+    @Test
+    void field13_maxValueGamma_doesNotCompleteEarly_field10_fills_gaps() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 5000);
+
+        // Price arrives first
+        dispatcher.tickPrice(reqId, 1, 174.40, null); // BID
+        dispatcher.tickPrice(reqId, 2, 177.60, null); // ASK
+        assertThat(future).isNotDone();
+
+        // Field 13: delta valid, gamma/vega/theta are MAX_VALUE sentinels
+        dispatcher.tickOptionComputation(reqId, 13, 0,
+                0.21, 0.53,            // IV + delta (valid)
+                2.50, 0,
+                Double.MAX_VALUE,      // gamma — sentinel
+                Double.MAX_VALUE,      // vega  — sentinel
+                Double.MAX_VALUE,      // theta — sentinel
+                5835.0);
+        // Must NOT complete — gamma is null so greeksReceived=false
+        assertThat(future).isNotDone();
+
+        // Field 10: bid-based computation delivers valid gamma/vega/theta
+        dispatcher.tickOptionComputation(reqId, 10, 0,
+                0.21, 0.53,
+                2.48, 0,
+                0.0009, 7.8, -1.40,    // gamma, vega, theta — all valid
+                5835.0);
+        // Now greeksReceived=true (delta + gamma both present) AND bid is set → early complete
+        assertThat(future).isDone();
+
+        TickData result = future.join();
+        assertThat(result.delta()).isEqualTo(0.53);
+        assertThat(result.gamma()).isEqualTo(0.0009);
+        assertThat(result.vega()).isEqualTo(7.8);
+        assertThat(result.theta()).isEqualTo(-1.40);
+        assertThat(result.greeksReceived()).isTrue();
+    }
+
+    /**
+     * reqMktData sets expectGreeks=true. tryCompleteEarly requires BOTH greeksReceived AND
+     * at least one price field. The future must stay pending after Greeks alone, then complete
+     * immediately once a price tick also arrives — without waiting for the 5-second timeout.
+     */
+    @Test
+    void reqMktData_completes_early_when_price_and_greeks_received() {
+        int reqId = dispatcher.reqIdCounter.get();
+        CompletableFuture<TickData> future = dispatcher.reqMktData(mockContract, 5000);
+
+        // Greeks arrive first — price still missing, must not complete yet
+        dispatcher.tickOptionComputation(reqId, 13, 0,
+                0.20, 0.45, 2.50, 0, 0.02, 0.01, -0.05, 5000.0);
+        assertThat(future).isNotDone();
+
+        // Price arrives — both conditions met → early completion
+        dispatcher.tickPrice(reqId, 4, 2.48, null); // field 4 = LAST
+
+        assertThat(future).isDone();
+        assertThat(future.join().delta()).isEqualTo(0.45);
     }
 }
