@@ -24,5 +24,8 @@ public class UserAccount {
     @Column(nullable = false, precision = 19, scale = 4)
     private BigDecimal availableBalance;
 
+    @Version
+    private Integer version; // Optimistic locking — intentionally absent from "broken" experiment
+
     private LocalDateTime updatedAt = LocalDateTime.now();
 }
